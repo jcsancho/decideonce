@@ -4,14 +4,18 @@
       {
         "id": "decideonce-workflow",
         "path": "skills/decideonce-workflow/SKILL.md"
+      },
+      {
+        "id": "decideonce-design",
+        "path": "skills/decideonce-design/SKILL.md"
       }
     ]
   },
   "compat": {
     "manifestDir": ".muse-plugin"
   },
-  "description": "Find decision points in workflows and hand confident ones to hosted Jev.",
+  "description": "Find decision points in workflows, or design new workflows decision-first, and hand confident decisions to decision models.",
   "name": "decideonce",
   "schemaVersion": 1,
-  "version": "0.1.0"
+  "version": "0.1.1"
 }

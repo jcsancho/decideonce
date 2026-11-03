@@ -271,67 +271,67 @@ def main() -> None:
         print(f"decideonce: MCP tool {old} is deprecated, use do_"
               f"{old[3:]}", file=sys.stderr)
 
-    @server.tool(description=DESCRIPTIONS["do_analyze"])
+    @server.tool(description="Deprecated alias of do_analyze. " + DESCRIPTIONS["do_analyze"])
     def dm_analyze(payload: dict) -> str:
         _dm_tool_warn("dm_analyze")
         return _run(svc.do_analyze, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_register"])
+    @server.tool(description="Deprecated alias of do_register. " + DESCRIPTIONS["do_register"])
     def dm_register(payload: dict) -> str:
         _dm_tool_warn("dm_register")
         return _run(svc.do_register, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_decide"])
+    @server.tool(description="Deprecated alias of do_decide. " + DESCRIPTIONS["do_decide"])
     def dm_decide(payload: dict) -> str:
         _dm_tool_warn("dm_decide")
         return _run(svc.do_decide, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_record"])
+    @server.tool(description="Deprecated alias of do_record. " + DESCRIPTIONS["do_record"])
     def dm_record(payload: dict) -> str:
         _dm_tool_warn("dm_record")
         return _run(svc.do_record, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_outcome"])
+    @server.tool(description="Deprecated alias of do_outcome. " + DESCRIPTIONS["do_outcome"])
     def dm_outcome(payload: dict) -> str:
         _dm_tool_warn("dm_outcome")
         return _run(svc.do_outcome, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_train"])
+    @server.tool(description="Deprecated alias of do_train. " + DESCRIPTIONS["do_train"])
     def dm_train(payload: dict) -> str:
         _dm_tool_warn("dm_train")
         return _run(svc.do_train, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_promote"])
+    @server.tool(description="Deprecated alias of do_promote. " + DESCRIPTIONS["do_promote"])
     def dm_promote(payload: dict) -> str:
         _dm_tool_warn("dm_promote")
         return _run(svc.do_promote, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_report"])
+    @server.tool(description="Deprecated alias of do_report. " + DESCRIPTIONS["do_report"])
     def dm_report(payload: dict) -> str:
         _dm_tool_warn("dm_report")
         return _run(svc.do_report, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_export"])
+    @server.tool(description="Deprecated alias of do_export. " + DESCRIPTIONS["do_export"])
     def dm_export(payload: dict) -> str:
         _dm_tool_warn("dm_export")
         return _run(svc.do_export, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_extract"])
+    @server.tool(description="Deprecated alias of do_extract. " + DESCRIPTIONS["do_extract"])
     def dm_extract(payload: dict) -> str:
         _dm_tool_warn("dm_extract")
         return _run(svc.do_extract, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_plan_run"])
+    @server.tool(description="Deprecated alias of do_plan_run. " + DESCRIPTIONS["do_plan_run"])
     def dm_plan_run(payload: dict) -> str:
         _dm_tool_warn("dm_plan_run")
         return _run(svc.do_plan_run, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_plan_result"])
+    @server.tool(description="Deprecated alias of do_plan_result. " + DESCRIPTIONS["do_plan_result"])
     def dm_plan_result(payload: dict) -> str:
         _dm_tool_warn("dm_plan_result")
         return _run(svc.do_plan_result, payload)
 
-    @server.tool(description=DESCRIPTIONS["do_autopilot_status"])
+    @server.tool(description="Deprecated alias of do_autopilot_status. " + DESCRIPTIONS["do_autopilot_status"])
     def dm_autopilot_status(payload: dict) -> str:
         _dm_tool_warn("dm_autopilot_status")
         return _run(svc.do_autopilot_status, payload)

@@ -177,9 +177,10 @@ every point the moment the limits differ from the signed approval
 (`not_approved`) until you re-approve.
 
 Honest limit: an agent with a shell can no longer approve by accident or
-casually — approval needs your envsave master password to sign. It could still
-replace the public key and sign with its own key, but that is a deliberate
-attack: the report and notifications show it as `trust_key_changed`. This is
+casually — approval needs your envsave master password to sign. But a
+deliberate shell attacker can swap the public key, sign with their own key,
+write the meta rows including the fingerprint, and suppress
+`trust_key_changed` entirely — nothing in this design stops that. This is
 defence in depth, not a sandbox.
 
 ## License

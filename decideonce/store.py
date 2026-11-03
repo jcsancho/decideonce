@@ -1456,6 +1456,12 @@ for _name in ("version", "migrate", "close", "put_point", "get_point", "list_poi
               "autopilot_log_add", "autopilot_log_recent",
               "job_put", "job_get", "job_update", "jobs_running",
               "jobs_latest", "smoke_done_exists",
+              "job_insert_launching", "job_claim_launch", "job_finalize",
+              "job_note_status_failure", "job_reset_status_failures",
+              "jobs_launching", "latest_autopilot_failure_at",
+              "cas_point_phase", "try_record_teacher", "try_set_outcome",
+              "eval_only_transcript_ids", "purge_extracted_text",
+              "purge_plans", "transcript_plan_flags",
               "autopilot_month_counted"):
     setattr(Store, _name, _locked(getattr(Store, _name)))
 del _name

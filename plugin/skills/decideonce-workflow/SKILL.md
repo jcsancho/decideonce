@@ -41,7 +41,9 @@ return `{ok: true, ...}` or `{ok: false, error, message}`.
   Rules run in code before Jev; Jev-type models miss such details.
 - Mark irreversible actions (payment, delete, external mail) `irreversible: true`.
 - If the decision follows a written policy, pass it as `policy`: it is sent
-  with every call and versioned like options and fields.
+  with every call (inside `state`) and versioned like options and fields.
+  State-vs-question weighting is unmeasured, so also compress the decisive
+  lines into the `question`.
 
 ## 3. Rewrite the workflow
 

@@ -235,15 +235,29 @@ def verify_approval(b64_pub: str, b64_sig: str, project: str, eff_hash: str,
         return False
 
 
+def _parse_envsave_show(text: str, key_name: str) -> str | None:
+    """Extract the secret from `envsave show` output, or None.
+
+    Real format (R3-1): `  DECIDE_AUTOPILOT_SIGNING_KEY = <secret>`.
+    Anything else fails loudly instead of decoding a prompt line.
+    """
+    import re as _re
+
+    pat = _re.compile(r"^\s*" + _re.escape(key_name) + r"\s*=\s*(\S+)\s*$")
+    for ln in text.splitlines():
+        m = pat.match(ln)
+        if m:
+            return m.group(1)
+    return None
+
+
 def _read_envsave_secret(key_name: str, out, env_runner=None) -> str | None:
-    """Read a secret via `envsave show`. Returns the stripped secret or None.
+    """Read a secret via `envsave show`. Returns the secret or None.
 
     The password prompt is expected on stderr (Unix convention: data on
     stdout, prompts on stderr), so stderr and stdin stay attached to the
-    terminal while stdout is captured. If envsave prints the prompt on
-    stdout instead, the last non-empty line is taken as the secret and any
-    earlier lines are echoed so the user sees them. env_runner (tests)
-    replaces the subprocess call.
+    terminal while stdout is captured. env_runner (tests) replaces the
+    subprocess call.
     """
     import sys
 
@@ -261,34 +275,27 @@ def _read_envsave_secret(key_name: str, out, env_runner=None) -> str | None:
             out("error: envsave show failed (is the vault unlocked?)")
             return None
         text = stdout if isinstance(stdout, str) else stdout.decode(errors="replace")
-        lines = [ln for ln in text.splitlines() if ln.strip()]
-        return lines[-1].strip() if lines else None
-    out("envsave will ask for your master password if the vault is locked...")
-    try:
-        proc = subprocess.run(
-            ["envsave", "show", key_name], stdin=sys.stdin,
-            stdout=subprocess.PIPE, stderr=sys.stderr, timeout=120)
-    except Exception as e:
-        out(f"error: envsave failed: {e}")
+    else:
+        out("envsave will ask for your master password if the vault is locked...")
+        try:
+            proc = subprocess.run(
+                ["envsave", "show", key_name], stdin=sys.stdin,
+                stdout=subprocess.PIPE, stderr=sys.stderr, timeout=120)
+        except Exception as e:
+            out(f"error: envsave failed: {e}")
+            return None
+        if proc.returncode != 0:
+            out("error: envsave show failed (is the vault unlocked?)")
+            return None
+        try:
+            text = proc.stdout.decode(errors="replace")
+        except Exception:
+            text = ""
+    secret = _parse_envsave_show(text, key_name)
+    if not secret:
+        out(f"error: envsave show did not print '{key_name} = <secret>'")
         return None
-    if proc.returncode != 0:
-        out("error: envsave show failed (is the vault unlocked?)")
-        return None
-    try:
-        text = proc.stdout.decode(errors="replace")
-    except Exception:
-        text = ""
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    if not lines:
-        out("error: envsave returned no secret")
-        return None
-    if len(lines) > 1:
-        for ln in lines[:-1]:
-            try:
-                print(ln, file=sys.stderr)
-            except Exception:
-                pass
-    return lines[-1].strip()
+    return secret
 
 
 def run_keygen(cfg_path, store, out, env_runner=None) -> str:
@@ -313,14 +320,19 @@ def run_keygen(cfg_path, store, out, env_runner=None) -> str:
     fp = fingerprint_pubkey(b64_pub) or "?"
     # Store the private key in envsave (value on stdin, never argv). The
     # password prompt (if any) is expected on /dev/tty or stderr, not stdin.
+    # R3-1: exit 0 alone proves nothing (without Touch ID nothing is stored),
+    # so stdout must carry Added:/Updated: before the public key is written.
+    set_stdout = ""
     if env_runner is not None:
         try:
-            code = env_runner(["envsave", "set", SIGNING_KEY_NAME], b64_priv)
+            res = env_runner(["envsave", "set", SIGNING_KEY_NAME], b64_priv)
         except Exception as e:
             out(f"error: envsave set failed: {e}")
             return "error"
-        if isinstance(code, tuple):
-            code = code[0]
+        if isinstance(res, tuple):
+            code, set_stdout = res[0], (res[1] if len(res) > 1 else "")
+        else:
+            code = res
         if code != 0:
             out("error: envsave set failed")
             return "error"
@@ -331,7 +343,7 @@ def run_keygen(cfg_path, store, out, env_runner=None) -> str:
             proc = subprocess.run(
                 ["envsave", "set", SIGNING_KEY_NAME],
                 input=(b64_priv + "\n").encode(),
-                stdout=sys.stdout, stderr=sys.stderr, timeout=120)
+                stdout=subprocess.PIPE, stderr=sys.stderr, timeout=120)
         except Exception as e:
             out(f"error: envsave set failed: {e}")
             return "error"
@@ -339,6 +351,20 @@ def run_keygen(cfg_path, store, out, env_runner=None) -> str:
             out("error: envsave set failed; the key was not stored. "
                 "Run it yourself: envsave set " + SIGNING_KEY_NAME)
             return "error"
+        try:
+            set_stdout = proc.stdout.decode(errors="replace")
+        except Exception:
+            set_stdout = ""
+    for ln in set_stdout.splitlines():
+        if ln.strip():
+            out(ln.strip())
+    if "Added:" not in set_stdout and \
+            f"Updated: {SIGNING_KEY_NAME}" not in set_stdout:
+        out("error: envsave set stored nothing (no Added:/Updated: line "
+            "on stdout; the vault may need Touch ID). Run "
+            f"`envsave set {SIGNING_KEY_NAME}` yourself or enable Touch ID, "
+            "then re-run keygen.")
+        return "error"
     # Wipe the private key from memory (best effort in Python).
     try:
         b64_priv = "0" * len(b64_priv)
@@ -425,7 +451,7 @@ def run_approve(cfg: dict, store, *, is_tty: bool, out,
     import base64
 
     try:
-        raw_priv = base64.b64decode(secret.strip())
+        raw_priv = base64.b64decode(secret.strip(), validate=True)
     except Exception:
         out("error: the stored signing key is not valid base64")
         return "error"
