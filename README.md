@@ -18,6 +18,39 @@ work (it analyses workflows and acts as the teacher). The hosted path needs
 install is `local_legacy`, where "promote to shadow" needs a trained probe
 instead of "no training".
 
+## Built during the Meta AI Developer Hackathon
+
+Everything in this repository was written during the hackathon (event opened 26 Oct 2026; first line of
+code 1 Nov 2026), by one person (solo, Indie Developer track), with Meta's Muse Code coding agent. The
+development history is 73 commits from 1 to 3 Nov 2026; this public repository is a code-only export
+of it, so it shows one commit per export.
+
+**Built by us during the event**
+
+- The DecideOnce MCP server (`decideonce/`):
+  - decision core and store (`do_decide`, `do_record`, `do_outcome`)
+  - discovery v1: rubric, text hints, agent-proposed candidates, plain trace detector (`do_analyze`, `do_register`)
+  - shadow and serve gates: error bound, margin over random escalation, audits, drift detection, demotion (`do_promote`, `do_report`)
+  - the hosted-Jev tier with automatic temperature and threshold fitting
+  - the zero-edit gateway, one-turn runs and the autopilot (`autopilot.py`)
+  - the training export for Fireworks (`export.py`, `trainer.py`)
+- The Muse plugin (`plugin/`) with two skills: `decideonce-workflow` for existing workflows and
+  `decideonce-design` for new, decision-first workflows.
+- For the demo video (kept in the private development repository):
+  - the synthetic refund-ticket generator and its written policy
+  - the live MCP demo driver
+  - the lead-routing pilot
+  - the Glimmer training export and evaluation scripts
+
+**Used, not built by us**
+
+- Meta: Muse Code (wrote the code from our spec), Muse Glimmer 30B (base model; we trained a LoRA on
+  Fireworks), Muse Wonder (heavy model in the lead-routing run), the Muse plugin system.
+- Hosted Jev 1.13 by TypeSafe, called through OpenRouter: the off-the-shelf decision model.
+- Fireworks: training infrastructure and the public `decision/kalshi_v1` cookbook recipe, adapted to our task.
+- Open-source libraries listed in `pyproject.toml` (MCP Python SDK, pydantic, jsonschema, numpy,
+  scikit-learn, cryptography).
+
 ## How it works
 
 ```
