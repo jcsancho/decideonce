@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/point.json",
+  "title": "Decision point (spec §1.1)",
+  "type": "object",
+  "required": ["point_id", "workflow", "question", "kind", "options", "context_fields"],
+  "properties": {
+    "point_id": {"type": "string", "pattern": "^[a-z0-9_.-]{3,64}$"},
+    "workflow": {"type": "string", "minLength": 1, "maxLength": 128},
+    "question": {"type": "string", "minLength": 1, "maxLength": 1000},
+    "kind": {"type": "string", "enum": ["choice", "noul"]},
+    "options": {"type": "array", "minItems": 2, "maxItems": 256, "items": {"type": "string", "minLength": 1}},
+    "option_help": {"type": "object", "additionalProperties": {"type": "string"}},
+    "context_fields": {
+      "type": "object",
+      "maxProperties": 32,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": {"type": "string", "enum": ["string", "number", "integer", "boolean", "enum"]},
+          "enum": {"type": "array", "items": {"type": "string"}},
+          "max_len": {"type": "integer", "minimum": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "required_fields": {"type": "array", "items": {"type": "string"}},
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["if"],
+        "properties": {
+          "id": {"type": "string"},
+          "if": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "array",
+              "prefixItems": [
+                {"type": "string"},
+                {"type": "string", "enum": ["==", "!=", ">", ">=", "<", "<=", "in", "not_in", "contains"]}
+              ],
+              "minItems": 3,
+              "maxItems": 3
+            }
+          },
+          "only": {"type": "array", "items": {"type": "string"}},
+          "exclude": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+      }
+    },
+    "irreversible": {"type": "boolean"},
+    "suspected": {"type": "boolean"},
+    "repeatable": {"type": "boolean"},
+    "data_class": {"type": "string", "enum": ["public", "private"]},
+    "target_error": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.5},
+    "phase": {"type": "string", "enum": ["collect", "shadow", "serve", "paused"]},
+    "plan_phase": {"type": "string", "enum": ["collect", "shadow", "serve", "paused"]},
+    "point_version": {"type": "integer", "minimum": 1},
+    "source": {"type": "string", "enum": ["dm_decide", "gateway"]},
+    "route": {"type": "string", "enum": ["openai", "anthropic"]},
+    "model": {"type": "string", "minLength": 1},
+    "template": {
+      "type": "object",
+      "required": ["system", "user_prefix", "user_suffix"],
+      "properties": {
+        "system": {"type": "string"},
+        "user_prefix": {"type": "string"},
+        "user_suffix": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "output_format": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {"type": "string", "enum": ["enum_text", "json_enum"]},
+        "surface": {"type": "object", "additionalProperties": {"type": "string"}},
+        "path": {"type": "string"},
+        "skeleton": {"type": "object"},
+        "separators": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": true
+    },
+    "extract": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["regex"],
+        "properties": {
+          "regex": {"type": "string", "maxLength": 200},
+          "group": {"type": "integer", "minimum": 0},
+          "cast": {"type": "string", "enum": ["string", "number", "integer", "boolean"]}
+        },
+        "additionalProperties": false
+      }
+    },
+    "guard_fields": {"type": "array", "items": {"type": "string"}},
+    "multi_turn": {"type": "boolean"},
+    "discovery_key": {"type": "string"},
+    "fingerprint": {"type": "string"},
+    "tier": {"type": "string", "enum": ["hosted_jev", "private"]},
+    "remote_ok": {
+      "anyOf": [
+        {"type": "array", "items": {"type": "string", "enum": ["hosted_jev", "fireworks"]}},
+        {"type": "boolean"}
+      ]
+    },
+    "private_model_only": {"type": "boolean"},
+    "policy": {"type": "string", "maxLength": 20000},
+    "confirm": {"type": "boolean"}
+  },
+  "additionalProperties": true
+}

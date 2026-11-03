@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/dm_decide.json",
+  "title": "dm_decide input (spec §2.3)",
+  "type": "object",
+  "required": ["point_id", "context"],
+  "properties": {
+    "point_id": {"type": "string"},
+    "context": {"type": "object"},
+    "teacher_cost": {
+      "type": "object",
+      "properties": {
+        "tokens_in": {"type": "number"},
+        "tokens_out": {"type": "number"},
+        "usd": {"type": "number"},
+        "seconds": {"type": "number"}
+      },
+      "additionalProperties": true
+    },
+    "run_id": {"type": "string"},
+    "decision_pos": {
+      "type": ["object", "null"],
+      "required": ["event", "offset"],
+      "properties": {
+        "event": {"type": "integer"},
+        "offset": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "at_start": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

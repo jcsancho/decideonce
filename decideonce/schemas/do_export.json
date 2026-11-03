@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/dm_export.json",
+  "title": "dm_export input (spec §2.9)",
+  "type": "object",
+  "required": ["point_id", "path"],
+  "properties": {
+    "point_id": {"type": "string"},
+    "path": {"type": "string", "minLength": 1},
+    "confirm": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

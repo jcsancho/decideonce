@@ -1,0 +1,17 @@
+{
+  "capabilities": {
+    "skills": [
+      {
+        "id": "decideonce-workflow",
+        "path": "skills/decideonce-workflow/SKILL.md"
+      }
+    ]
+  },
+  "compat": {
+    "manifestDir": ".muse-plugin"
+  },
+  "description": "Find decision points in workflows and hand confident ones to hosted Jev.",
+  "name": "decideonce",
+  "schemaVersion": 1,
+  "version": "0.1.0"
+}

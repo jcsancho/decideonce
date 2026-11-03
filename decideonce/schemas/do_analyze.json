@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/dm_analyze.json",
+  "title": "dm_analyze input (spec §2.1; gateway options added in M9)",
+  "type": "object",
+  "properties": {
+    "workflow": {
+      "type": "object",
+      "properties": {
+        "kind": {"type": "string", "enum": ["skill", "prompt", "code"]},
+        "text": {"type": "string"},
+        "path": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "traces": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {"path": {"type": "string"}},
+      "additionalProperties": false
+    },
+    "candidates": {"type": "array", "items": {"type": "object"}},
+    "gateway": {"type": "boolean"},
+    "discovery_key": {"type": "string"},
+    "show_samples": {"type": "boolean"},
+    "confirm": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

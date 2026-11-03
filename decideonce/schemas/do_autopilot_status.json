@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/dm_autopilot_status.json",
+  "title": "dm_autopilot_status input (autopilot §4, read-only)",
+  "type": "object",
+  "properties": {},
+  "additionalProperties": false
+}

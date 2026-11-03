@@ -1,0 +1,30 @@
+[project]
+name = "decideonce"
+version = "0.1.0"
+description = "Learn the decisions inside agent workflows and hand confident ones to hosted Jev"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp",
+    "pydantic",
+    "jsonschema",
+    "numpy",
+    "scikit-learn",
+    "cryptography",
+]
+
+[project.scripts]
+decideonce = "decideonce.server:main"
+decideonce-gateway = "decideonce.gateway:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+markers = ["jev: needs a live JEV server on 127.0.0.1:8090"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["decideonce"]

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/dm_extract.json",
+  "title": "dm_extract (§15.2): call 1 submits a transcript, call 2 submits records",
+  "type": "object",
+  "properties": {
+    "transcript": {"type": "object"},
+    "path": {"type": "string"},
+    "transcript_id": {"type": "string"},
+    "pass": {"type": "integer", "enum": [1, 2]},
+    "contributor_off_confirmed": {"type": "boolean"},
+    "extractor_local": {"type": "boolean"},
+    "extraction_id": {"type": "string"},
+    "extractor": {"type": "string"},
+    "records": {"type": "array"},
+    "new_points": {"type": "array"},
+    "eval_only": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

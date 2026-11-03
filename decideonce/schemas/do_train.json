@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/dm_train.json",
+  "title": "dm_train input (spec §2.6)",
+  "type": "object",
+  "required": ["point_id"],
+  "properties": {
+    "point_id": {"type": "string"},
+    "dry_run": {"type": "boolean"},
+    "force": {"type": "boolean"},
+    "confirm": {"type": "boolean"},
+    "training_free_confirmed": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

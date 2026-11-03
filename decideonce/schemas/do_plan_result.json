@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/dm_plan_result.json",
+  "title": "dm_plan_result input (spec §15.5)",
+  "type": "object",
+  "required": ["plan_id"],
+  "properties": {
+    "plan_id": {"type": "string"},
+    "transcript": {"type": "object"},
+    "final_output": {"type": "string"},
+    "cost": {"type": "object"},
+    "conflict": {"type": "string"},
+    "trial_id": {"type": "string"},
+    "pair_id": {"type": "string"},
+    "arm": {"type": "string", "enum": ["expensive", "cheap"]},
+    "eval_only": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}

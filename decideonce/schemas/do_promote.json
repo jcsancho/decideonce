@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/dm_promote.json",
+  "title": "dm_promote input (spec §2.7, §15.6, §15.8)",
+  "type": "object",
+  "properties": {
+    "point_id": {"type": "string"},
+    "phase": {"type": "string", "enum": ["collect", "shadow", "serve", "paused"]},
+    "plan_phase": {"type": "string", "enum": ["collect", "shadow", "serve", "paused"]},
+    "workflow": {"type": "string"},
+    "downgrade": {"type": "boolean"},
+    "confirm": {"type": "boolean"},
+    "tier": {"type": "string", "enum": ["hosted_jev", "private"]}
+  },
+  "additionalProperties": false
+}

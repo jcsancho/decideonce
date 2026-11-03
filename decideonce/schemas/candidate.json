@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/candidate.json",
+  "title": "dm_analyze candidate: draft decision point + rubric answers (spec §3.1)",
+  "type": "object",
+  "required": ["draft", "answers"],
+  "properties": {
+    "draft": {
+      "type": "object",
+      "required": ["options"],
+      "properties": {
+        "point_id": {"type": "string"},
+        "workflow": {"type": "string"},
+        "question": {"type": "string"},
+        "kind": {"type": "string", "enum": ["choice", "noul"]},
+        "options": {"type": "array", "items": {"type": "string"}},
+        "option_help": {"type": "object"},
+        "context_fields": {"type": "object"},
+        "required_fields": {"type": "array", "items": {"type": "string"}},
+        "rules": {"type": "array"},
+        "irreversible": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "answers": {
+      "type": "object",
+      "required": ["R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8"],
+      "properties": {
+        "R1": {"type": "string", "enum": ["yes", "no"]},
+        "R2": {"type": "string", "enum": ["yes", "no"]},
+        "R3": {"type": "string",
+               "enum": ["rule", "routing", "triage", "relevance", "priority",
+                        "correctness", "other"]},
+        "R4": {"type": "integer", "minimum": 0},
+        "R5": {"type": "string", "enum": ["yes", "no"]},
+        "R6": {"type": "object",
+               "required": ["sensitive", "covered"],
+               "properties": {"sensitive": {"type": "boolean"},
+                              "covered": {"type": "boolean"}},
+               "additionalProperties": false},
+        "R7": {"type": "string", "enum": ["yes", "no"]},
+        "R8": {"type": "object",
+               "properties": {"tokens": {"type": "integer", "minimum": 0},
+                              "separate_call": {"type": "boolean"}},
+               "additionalProperties": false}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

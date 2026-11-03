@@ -1,0 +1,125 @@
+# Default config for decideonce (spec §8). Path from DECIDEONCE_CONFIG.
+# Every default below is a config value: change the config, not the code.
+
+[store]
+data_dir = "~/.decideonce"
+project = "default"
+max_rows_per_point = 50000
+
+[jev]
+url = "http://127.0.0.1:8090"
+timeout_s = 10
+
+[decider]
+# Default stays local_legacy until M12 (review D): set "tiered" (+ key_ref and
+# monthly_budget_usd below) for the hosted path; shadow needs training here.
+backend = "local_legacy"  # "tiered" | "local_legacy" (current probe path, until M12) | "fake"
+timeout_s = 3
+
+[hosted_jev]
+url = "https://openrouter.ai/api/v1/systemone"
+model = "typesafe/jev-1.13"
+key_ref = ""
+price_per_mtok_in = 0.042
+monthly_budget_usd = 0
+fit_rows = 200
+min_private_gain = 0.05
+min_compare = 100
+redemote_window_days = 30
+pack = false  # true is refused at startup (one request per point, G7)
+reserve_usd = 0.0005
+fake_accuracy = 0.97
+
+[analyze]
+min_group = 20
+weights = {R2 = 2, R3 = 2, R4_high = 2, R4_mid = 1, R5 = 1, R6 = -1, R8 = 1}
+good_fit = 6
+possible = 3
+
+[train]
+min_train = 60
+min_examples = 200
+min_per_option = 5
+holdout = 0.25
+calib = 0.15
+teacher_only_weight = 1.0
+teacher_alarm = 0.10
+
+[fireworks]
+url = "https://api.fireworks.ai"
+key_ref = ""
+monthly_budget_usd = 0  # 0 = no billed Fireworks call of any kind; setting it is the spending approval
+allow_paid_training = false
+smoke_examples = 32
+epochs = 2
+train_price_per_mtok = 5.86
+eval_price_per_decision = 0.0012
+
+[autopilot]
+enabled = false  # default off: v1.8 behaviour unchanged
+points = []  # point ids or globs allowed on autopilot, e.g. ["refund.*"]; [] = none
+max_target_error = 0.02
+auto_serve = true
+auto_train = true
+max_job_usd = 0.0  # 0 = autopilot never trains
+max_monthly_jobs_usd = 0.0
+min_new_rows = 100
+free_training_until = ""  # set only after the user checked the smoke job was not billed
+cooldown_days = 7
+check_interval_min = 10
+notify_cmd = ""  # e.g. ["hivey", "msg", "send", "human"]; run with a one-line message, no shell
+
+[autopilot_trust]
+public_key = ""  # set by `decideonce autopilot keygen` (base64 Ed25519)
+
+[serve]
+target_error = 0.02
+min_auto_support = 30
+min_coverage = 0.20
+min_margin_vs_random = 0.02
+min_option_recall = 0.8
+min_shadow = 30
+audit_rate = 0.10
+drift_window = 100
+allow_auto_irreversible = false
+
+[gateway]
+host = "127.0.0.1"
+port = 8787
+local_token = ""
+upstreams = {openai = "https://api.openai.com", anthropic = "https://api.anthropic.com"}
+log_unmatched = false
+log_allow = []
+trace_data_class = "private"
+trace_retention_days = 30
+point_retention_days = 90
+min_template_chars = 40
+template_min_match = 0.95
+max_state_chars = 8000
+format_min_n = 200
+format_match_min = 0.97
+max_unparsed = 0.02
+jev_timeout_s = 5
+upstream_timeout_s = 120
+
+[extract]
+audit_rate = 0.2
+min_audited = 30
+min_agreement = 0.9
+weight = 0.5
+transcript_retention_days = 90
+
+[plan]
+min_at_start = 0.9
+target_error = 0.02
+min_shadow = 30
+audit_rate = 0.10
+max_quality_drop = 0.05
+trial_looks = [60, 120, 200, 400]
+trial_z = 2.36
+pair_timeout_h = 24
+downgrade_audit_rate = 0.2
+monitor_window = 120
+monitor_min_pairs = 30
+allow_pilot_force = false
+check_timeout_s = 30

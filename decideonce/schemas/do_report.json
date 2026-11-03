@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/dm_report.json",
+  "title": "dm_report input (spec §2.8, §15.8)",
+  "type": "object",
+  "properties": {
+    "point_id": {"type": "string"},
+    "workflow": {"type": "string"},
+    "format": {"type": "string", "enum": ["json", "md"]}
+  },
+  "additionalProperties": false
+}

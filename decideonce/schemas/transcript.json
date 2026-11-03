@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/transcript.json",
+  "title": "transcript (§15.1)",
+  "type": "object",
+  "required": ["run_id", "workflow", "model", "input", "events", "final_output"],
+  "properties": {
+    "run_id": {"type": "string", "minLength": 1},
+    "workflow": {"type": "string", "minLength": 1},
+    "model": {"type": "string"},
+    "data_class": {"type": "string", "enum": ["public", "private"], "default": "private"},
+    "input": {"type": "string"},
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["i", "type", "content"],
+        "properties": {
+          "i": {"type": "integer", "minimum": 0},
+          "type": {"type": "string",
+                   "enum": ["reasoning", "text", "tool_call", "tool_result", "user"]},
+          "name": {"type": "string"},
+          "content": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "final_output": {"type": "string"},
+    "cost": {
+      "type": "object",
+      "properties": {
+        "tokens_in": {"type": "number"},
+        "tokens_out": {"type": "number"},
+        "usd": {"type": "number"},
+        "seconds": {"type": "number"}
+      },
+      "additionalProperties": true
+    },
+    "run_outcome": {
+      "type": "object",
+      "properties": {
+        "ok": {"type": "boolean"},
+        "note": {"type": "string"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

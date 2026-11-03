@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://decide-mcp/dm_outcome.json",
+  "title": "dm_outcome input (spec §2.5; plan form in §15.5)",
+  "type": "object",
+  "properties": {
+    "decision_id": {"type": "string"},
+    "plan_id": {"type": "string"},
+    "ok": {"type": "boolean"},
+    "correct_choice": {"type": "string"},
+    "note": {"type": "string"}
+  },
+  "additionalProperties": false
+}
