@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://decide-mcp/candidate.json",
-  "title": "dm_analyze candidate: draft decision point + rubric answers (spec §3.1)",
+  "$id": "urn:decideonce:candidate",
+  "title": "do_analyze candidate: draft decision point + rubric answers",
   "type": "object",
   "required": ["draft", "answers"],
   "properties": {

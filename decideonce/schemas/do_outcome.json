@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://decide-mcp/dm_outcome.json",
-  "title": "dm_outcome input (spec §2.5; plan form in §15.5)",
+  "$id": "urn:decideonce:do_outcome",
+  "title": "do_outcome input (includes the plan check-result form)",
   "type": "object",
   "properties": {
     "decision_id": {"type": "string"},

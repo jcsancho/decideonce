@@ -1,8 +1,8 @@
 """decideonce MCP server (stdio). No LLM inside: the only outbound calls are
-to the JEV backends (local server on local_legacy, §7.3; OpenRouter/TypeSafe
-on tiered, §7.7). Config path from DECIDEONCE_CONFIG.
+to hosted Jev (OpenRouter/TypeSafe) and, from M11, Fireworks. Config path
+from DECIDEONCE_CONFIG.
 
-Test hook: jev.url starting with "fake:" selects FakeJev ("fake:down" = failing).
+Test hook: [decider] backend = "fake" selects scripted fakes.
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ DESCRIPTIONS = {
                    "text|path}, [traces: {path}], [candidates]}. First call returns "
                    "rubric + candidate_schema + hints; with candidates, returns score "
                    "and verdict per candidate."),
-    "do_register": ("Create or update a decision point (§1.1 fields at top level: "
+    "do_register": ("Create or update a decision point (point fields at top level: "
                     "point_id*, workflow*, question*, kind, options*, context_fields*, "
                     "required_fields, rules, irreversible, data_class, target_error). "
                     "Returns the stored point + a call snippet to paste into the skill. "
@@ -50,20 +50,22 @@ DESCRIPTIONS = {
                   "[correct_choice], [note]}. Either ok or correct_choice may be given. "
                   "With plan_id + ok, records a user check result for a plan."),
     "do_train": ("Train the decision model for a point. Input: {point_id*, "
-                 "[dry_run], [confirm], [training_free_confirmed], [force]}. "
-                 "Local path: trains the JEV probe, returns metrics + model "
-                 "card. Tiered path with a trainer: dry_run shows the estimate "
-                 "and joining points; confirm launches the job (smoke first, "
-                 "then the paid-gated full job); repeat calls poll status."),
+                 "[dry_run], [confirm], [training_free_confirmed], [force], "
+                 "[idem], [cancel]}. "
+                 "dry_run shows the estimate and joining points; confirm "
+                 "launches the job (smoke first, then the paid-gated full "
+                 "job); repeat calls poll status. idem names the launch for "
+                 "crash recovery; cancel (a job_id, or true for this point's "
+                 "live job) kills it for good."),
     "do_promote": ("Move a point: {point_id*, phase* (collect|shadow|serve|paused), "
-                   "[confirm]}. shadow needs a trained probe (local_legacy) or the "
-                   "hosted key + a budget + remote_ok (tiered, no training); serve "
-                   "needs all §6.4 checks plus confirm:true (ask the user first). "
-                   "With plan_phase, moves plan phases (§15.6); with workflow + "
-                   "downgrade, enables downgrade after a passed trial (§15.8)."),
+                   "[confirm]}. shadow needs the "
+                   "hosted key + a budget + remote_ok (no training); serve "
+                   "needs every serve-gate check plus confirm:true (ask the user first). "
+                   "With plan_phase, moves plan phases through the plan-serve checks; "
+                   "with workflow + downgrade, enables downgrade after a passed trial."),
     "do_report": ("Per-point metrics. Input: {[point_id], [format json|md]}. Agreement, "
                  "coverage, auto share, audits, savings, drift, promotion blockers. "
-                 "With workflow, the one-turn workflow report (§15.8)."),
+                 "With workflow, the one-turn workflow report."),
     "do_export": ("Export labelled rows as JSONL. Input: {point_id*, path*, [confirm]}. "
                  "Private points need confirm:true."),
     "do_extract": ("Extract decision labels from a one-turn transcript (two "
@@ -93,19 +95,26 @@ DESCRIPTIONS = {
 def build_service() -> Service:
     from .config import resolve_config_path
     from .deciders.hosted import resolve_key
-    from .trainer import check_fireworks_host
+    from .trainer import build_live_trainer, check_fireworks_host
 
     cfg = load_config()
-    check_fireworks_host(cfg["fireworks"].get("url", ""))  # §7.6: refuse to start
+    check_fireworks_host(cfg["fireworks"].get("url", ""))  # refuse non-allow-listed hosts
     store = Store(data_root(cfg))
     deciders, _ = build_deciders(cfg, store)  # raises ConfigError: refuse to start
     fw_key = resolve_key(cfg["fireworks"].get("key_ref", ""))
-    return Service(cfg, store, deciders, fireworks_key=fw_key,
-                   config_path=resolve_config_path())
+    trainer, _ = build_live_trainer(cfg, store, fw_key)
+    svc = Service(cfg, store, deciders, trainer=trainer,
+                  fireworks_key=fw_key,
+                  config_path=resolve_config_path())
+    # F8/F9: a restart orphans evaluating rows (their thread died with the
+    # old process); they become eval_failed (retryable). Only here, never
+    # in the tick loop: another process may be evaluating right now.
+    svc.autopilot.recover_interrupted_evals()
+    return svc
 
 
 def _autopilot_loop() -> None:
-    """Background autopilot check every check_interval_min (M16).
+    """Background autopilot check every check_interval_min.
 
     Each tick builds fresh config/store/service handles like the main
     service (F3: same trainer/key/config_path wiring): no shared state
@@ -130,13 +139,15 @@ def _autopilot_loop() -> None:
             if cfg.get("autopilot", {}).get("enabled", False):
                 from .config import resolve_config_path
                 from .deciders.hosted import resolve_key
+                from .trainer import build_live_trainer
 
                 store = Store(data_root(cfg))
                 try:
                     deciders, _ = build_deciders(cfg, store)
                     fw_key = resolve_key(
                         cfg.get("fireworks", {}).get("key_ref", ""))
-                    svc = Service(cfg, store, deciders,
+                    trainer, _ = build_live_trainer(cfg, store, fw_key)
+                    svc = Service(cfg, store, deciders, trainer=trainer,
                                   fireworks_key=fw_key,
                                   config_path=resolve_config_path())
                     svc.autopilot_check()
@@ -164,10 +175,27 @@ def _autopilot_loop() -> None:
         _time.sleep(max(mins * 60, 60))
 
 
+def _cli_parser():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="decideonce",
+        description="DecideOnce MCP server (stdio). With no arguments, "
+                    "starts the server; 'autopilot keygen|approve' is "
+                    "terminal-only trust setup.")
+    sub = p.add_subparsers(dest="command")
+    ap = sub.add_parser("autopilot", help="terminal-only trust setup")
+    ap.add_argument("action", choices=["keygen", "approve"],
+                    help="'keygen' creates the signing key once; 'approve' "
+                         "signs the effective limits")
+    return p
+
+
 def _cli(argv: list[str]) -> None:
     """decideonce autopilot keygen|approve: terminal-only trust setup."""
-    if argv not in (["autopilot", "approve"], ["autopilot", "keygen"]):
-        print("usage: decideonce autopilot [keygen|approve]", file=sys.stderr)
+    ns = _cli_parser().parse_args(argv)  # --help exits 0, bad usage exits 2
+    if ns.command is None:
+        _cli_parser().print_usage(sys.stderr)
         sys.exit(2)
     from .config import resolve_config_path
 
@@ -178,7 +206,7 @@ def _cli(argv: list[str]) -> None:
         print(f"decideonce: {type(e).__name__}: {e}", file=sys.stderr)
         sys.exit(1)
     try:
-        if argv[1] == "keygen":
+        if ns.action == "keygen":
             from .autopilot import run_keygen
 
             res = run_keygen(resolve_config_path(), store, out=print)

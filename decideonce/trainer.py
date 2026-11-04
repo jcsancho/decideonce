@@ -1,25 +1,25 @@
 """Trainer interface (§7.5) and FakeTrainer (tests, autopilot M16).
 
 Main spec §7.5: `estimate(rows)`, `launch(rows) -> job_id`, `status(job_id)`,
-`checkpoint(job_id)`. The live `FireworksTrainer` is M11 (needs the cookbook
-recipe, the API client and P4's measurements); until then `Service(trainer=...)`
-takes a `FakeTrainer` in tests and `None` in production, where training
-automation stays dormant and manual tiered `do_train` keeps reporting
-`private_tier_not_built`.
+`checkpoint(job_id)`. The live `FireworksTrainer` is M11. F9:
+`build_live_trainer` builds it when the key resolves and the cookbook pin
+holds, else `(None, reason)` with the `do_train` reason.
 """
 from __future__ import annotations
 
 import json
-import math
 import uuid
 from abc import ABC, abstractmethod
+
+from .fireworks_export import TRAIN_ONLY_SOURCES
+from .store import row_key as _row_key
 
 
 class Trainer(ABC):
     """Async training-job backend (main spec §7.5)."""
 
     # A live trainer needs the Fireworks key; fakes never touch the network
-    # and skip the key gate the way FakeJev/FakeHostedTransport do.
+    # and skip the key gate the way FakeHostedTransport does.
     needs_key = True
 
     @abstractmethod
@@ -27,20 +27,66 @@ class Trainer(ABC):
         """Cost estimate for a job over rows. Returns at least estimate_usd."""
 
     @abstractmethod
-    def launch(self, rows: list[dict], kind: str) -> str:
-        """Upload rows and launch a job. Returns a job_id (status running)."""
+    def launch(self, rows: list[dict], kind: str, idem: str) -> str:
+        """Upload rows and launch a job. Returns a job_id (status running).
+
+        idem is the caller's idempotency key (GP2): the live trainer names
+        the job directory after it."""
 
     @abstractmethod
     def status(self, job_id: str) -> dict:
         """Poll a job: {"status": running|done|failed, ...metrics when done}."""
 
     @abstractmethod
+    def cancel(self, job_id: str) -> dict:
+        """Cancel a live job. Idempotent: a finished or unknown job returns
+        its terminal state, never raises."""
+
+    @abstractmethod
     def checkpoint(self, job_id: str) -> dict:
         """Per-point models of a finished job: {"per_point": {pid: {...}}}."""
 
+    def eval_rows(self, job_id: str) -> dict:
+        """The job's scored splits for background evaluation (F8):
+        {"calib": [...], "heldout": [...]}. Live trainers only."""
+        raise NotImplementedError(
+            "background evaluation needs a live trainer")
+
+    def progress(self, job_id: str) -> dict | None:
+        """Live progress for do_report (F9): {"step", "loss", ...} or
+        None when unknown. Optional: only live trainers report it."""
+        return None
+
+
+def live_trainer_unavailable_reason(cfg: dict, store, key) -> str:
+    """F9: "" when a live trainer can be built, else the do_train
+    reason (no_fireworks_key / cookbook_missing / cookbook_mismatch)."""
+    from .fireworks_trainer import FireworksTrainer
+
+    if not key:
+        return "no_fireworks_key"
+    pin = FireworksTrainer(cfg, store.root / "jobs", key=key).pin_status()
+    if pin["status"] == "ok":
+        return ""
+    if pin["status"] == "missing":
+        return "cookbook_missing"
+    return "cookbook_mismatch"
+
+
+def build_live_trainer(cfg: dict, store, key):
+    """F9: (FireworksTrainer, "") when the key resolves and the pin
+    holds, else (None, reason). server.py, gateway.py and the autopilot
+    loop build through here so all three agree."""
+    from .fireworks_trainer import FireworksTrainer
+
+    reason = live_trainer_unavailable_reason(cfg, store, key)
+    if reason:
+        return None, reason
+    return FireworksTrainer(cfg, store.root / "jobs", key=key), ""
+
 
 def check_fireworks_host(url: str) -> None:
-    """Refuse any Fireworks host but api.fireworks.ai (startup check, §7.6)."""
+    """Refuse any Fireworks host but api.fireworks.ai (startup check)."""
     import urllib.parse
 
     from .config import ConfigError
@@ -113,12 +159,12 @@ class FakeTrainer(Trainer):
                 "train_rows": len(train_rows), "eval_rows": n_eval,
                 "train_tokens": train_toks, "epochs": self.epochs, "kind": kind}
 
-    def launch(self, rows: list[dict], kind: str) -> str:
+    def launch(self, rows: list[dict], kind: str, idem: str = "") -> str:
         job_id = uuid.uuid4().hex[:12]
         self.jobs[job_id] = {"status": "running", "kind": kind,
-                             "rows": [dict(r) for r in rows]}
+                             "rows": [dict(r) for r in rows], "idem": idem}
         self.uploaded.append({"job_id": job_id, "kind": kind,
-                              "rows": [dict(r) for r in rows]})
+                              "rows": [dict(r) for r in rows], "idem": idem})
         return job_id
 
     def complete(self, job_id: str) -> dict:
@@ -169,6 +215,14 @@ class FakeTrainer(Trainer):
             out["error"] = job.get("error", "failed")
         return out
 
+    def cancel(self, job_id: str) -> dict:
+        job = self.jobs.get(job_id)
+        if job is None or job["status"] not in ("running",):
+            return {"status": (job or {}).get("status", "cancelled"),
+                    "kind": (job or {}).get("kind", "")}
+        job["status"] = "cancelled"
+        return {"status": "cancelled", "kind": job["kind"]}
+
     def checkpoint(self, job_id: str) -> dict:
         job = self.jobs[job_id]
         if job["status"] != "done":
@@ -182,23 +236,80 @@ class FakeTrainer(Trainer):
 
 
 def split_rows(rows: list[dict], holdout: float, calib: float) -> list[dict]:
-    """Time-ordered per-point split (§7.2 step 1): train/calib/heldout tails."""
+    """Time-ordered per-point split (§7.2 step 1): train/calib/heldout.
+
+    Run-aware (§15.4): with 2+ runs, whole
+    runs go to one side by run fraction (latest runs held out); rows
+    without run_id split by row. A single run falls back to the row split.
+    """
     by_point: dict[str, list[dict]] = {}
     for r in rows:
         by_point.setdefault(r["point_id"], []).append(r)
     out = []
     for pid, rs in by_point.items():
-        n = len(rs)
-        n_hold = min(n - 1, int(round(n * holdout))) if n > 1 else 0
-        n_calib = min(max(n - n_hold - 1, 0), int(round(n * calib))) if n > 1 else 0
-        for i, r in enumerate(rs):
+        out.extend(_split_point(rs, holdout, calib))
+    for r in out:
+        if r.get("source") in TRAIN_ONLY_SOURCES:
+            r["split"] = "train"  # synthetic rows never enter evidence (T-FW1)
+    out.sort(key=_row_key)
+    return out
+
+
+def _split_point(rs: list[dict], holdout: float, calib: float) -> list[dict]:
+    run_order: list = []
+    run_idx: dict = {}
+    solos: list[int] = []
+    for i, r in enumerate(rs):
+        rid = r.get("run_id")
+        if rid is None:
+            solos.append(i)
+        elif rid not in run_idx:
+            run_idx[rid] = [i]
+            run_order.append(rid)
+        else:
+            run_idx[rid].append(i)
+    if len(run_order) >= 2:
+        return _split_runs(rs, run_order, solos, holdout, calib)
+    n = len(rs)
+    n_hold = min(n - 1, int(round(n * holdout))) if n > 1 else 0
+    n_calib = min(max(n - n_hold - 1, 0), int(round(n * calib))) if n > 1 else 0
+    out = []
+    for i, r in enumerate(rs):
+        split = "train"
+        if i >= n - n_hold:
+            split = "heldout"
+        elif i >= n - n_hold - n_calib:
+            split = "calib"
+        out.append({**r, "split": split})
+    return out
+
+
+def _split_runs(rs: list[dict], run_order: list, solos: list[int],
+               holdout: float, calib: float) -> list[dict]:
+    """Whole runs to one side; the earliest run always trains."""
+    n_hold_runs = max(1, int(round(len(run_order) * holdout)))
+    n_hold_runs = min(n_hold_runs, len(run_order) - 1)
+    hold_runs = set(run_order[len(run_order) - n_hold_runs:])
+    rest = [rid for rid in run_order if rid not in hold_runs]
+    n_calib_runs = min(len(rest) - 1, int(round(len(rest) * calib))) \
+        if rest else 0
+    calib_runs = set(rest[len(rest) - n_calib_runs:]) if n_calib_runs else set()
+    n_solo_hold = int(round(len(solos) * holdout))
+    n_solo_calib = int(round(len(solos) * calib))
+    tail = len(solos) - n_solo_hold
+    solo_hold = set(solos[tail:]) if n_solo_hold else set()
+    solo_calib = set(solos[max(0, tail - n_solo_calib):tail]) \
+        if n_solo_calib else set()
+    out = []
+    for i, r in enumerate(rs):
+        rid = r.get("run_id")
+        if rid in hold_runs or i in solo_hold:
+            split = "heldout"
+        elif rid in calib_runs or i in solo_calib:
+            split = "calib"
+        else:
             split = "train"
-            if i >= n - n_hold:
-                split = "heldout"
-            elif i >= n - n_hold - n_calib:
-                split = "calib"
-            out.append({**r, "split": split})
-    out.sort(key=lambda r: (r.get("ts", ""), r.get("decision_id", "")))
+        out.append({**r, "split": split})
     return out
 
 

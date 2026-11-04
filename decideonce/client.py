@@ -30,7 +30,7 @@ class Decider:
     """Same store, same code paths as the MCP tools."""
 
     def __init__(self, project: str | None = None, config_path: str | None = None,
-                 jev=None, seed: int | None = None):
+                 deciders=None, seed: int | None = None):
         from .config import data_root, load_config
         from .deciders import build_deciders
         from .service import Service
@@ -40,9 +40,9 @@ class Decider:
             cfg["store"]["project"] = project
         self.cfg = cfg
         self.store = Store(data_root(cfg))
-        if jev is None:
-            jev, _ = build_deciders(cfg, self.store)
-        self.svc = Service(cfg, self.store, jev,
+        if deciders is None:
+            deciders, _ = build_deciders(cfg, self.store)
+        self.svc = Service(cfg, self.store, deciders,
                            rng=random.Random(seed) if seed is not None else None)
 
     def close(self) -> None:

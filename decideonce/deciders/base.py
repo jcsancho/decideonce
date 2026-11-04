@@ -7,13 +7,28 @@ from dataclasses import dataclass, field
 
 class DeciderError(Exception):
     """Backend failure. code in {"timeout", "http", "bad_response",
-    "budget_exceeded", "no_key", "host_not_allowed", "remote_not_allowed"}.
-    msg carries detail (e.g. "auth_failed", "rate_limited" for "http")."""
+    "budget_exceeded", "no_key", "host_not_allowed", "remote_not_allowed",
+    "unavailable"}. msg carries detail (e.g. "auth_failed",
+    "rate_limited" for "http"; "private_warming" for "unavailable")."""
 
     def __init__(self, code: str, msg: str = ""):
         super().__init__(f"{code}: {msg}" if msg else code)
         self.code = code
         self.msg = msg
+
+
+def record_decider_error(store, decider, point_id: str,
+                         e: DeciderError) -> None:
+    """Count a decider failure under its own backend (F7: private errors
+    must not inflate the hosted counters)."""
+    if getattr(decider, "name", "") == "private":
+        from .session import record_private_error
+
+        record_private_error(store, point_id, e)
+    else:
+        from .hosted import record_hosted_error
+
+        record_hosted_error(store, point_id, e)
 
 
 @dataclass(frozen=True)
@@ -28,17 +43,12 @@ class DecideRequest:
 @dataclass
 class DecideResult:
     probs: dict  # over ALL registered options, sums to 1 (unmasked)
-    decider: str  # "hosted_jev" | "private" | "local_probe" | "fake"
+    decider: str  # "hosted_jev" | "private" | "fake"
     model: str  # e.g. "typesafe/jev-1.13"
     seconds: float
-    cost_usd: float  # 0.0 for local/fake
+    cost_usd: float  # 0.0 for fake
     tokens_in: int | None = None
     warnings: list = field(default_factory=list)
-    # legacy privates: LocalProbeDecider fills these so do_decide/_plan_predict
-    # and the gateway keep their exact current behaviour.
-    _hidden: list | None = None
-    _zs_full: dict | None = None
-    _probe_full: dict | None = None
 
 
 class Decider(ABC):

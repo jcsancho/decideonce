@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://decide-mcp/dm_export.json",
-  "title": "dm_export input (spec §2.9)",
+  "$id": "urn:decideonce:do_export",
+  "title": "do_export input",
   "type": "object",
   "required": ["point_id", "path"],
   "properties": {

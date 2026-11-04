@@ -1,20 +1,25 @@
 [project]
 name = "decideonce"
-version = "0.1.0"
+version = "0.1.1"
 description = "Learn the decisions inside agent workflows and hand confident ones to hosted Jev"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Jose Carlos Sancho"}]
 requires-python = ">=3.11"
 dependencies = [
     "mcp",
     "pydantic",
     "jsonschema",
-    "numpy",
-    "scikit-learn",
     "cryptography",
 ]
 
 [project.scripts]
 decideonce = "decideonce.server:main"
 decideonce-gateway = "decideonce.gateway:main"
+
+[project.urls]
+Homepage = "https://github.com/jcsancho/decideonce"
+Repository = "https://github.com/jcsancho/decideonce"
 
 [build-system]
 requires = ["hatchling"]
@@ -24,7 +29,7 @@ build-backend = "hatchling.build"
 dev = ["pytest"]
 
 [tool.pytest.ini_options]
-markers = ["jev: needs a live JEV server on 127.0.0.1:8090"]
+markers = ["cookbook: needs the local cookbook venv (offline row checks)"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["decideonce"]

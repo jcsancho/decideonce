@@ -62,7 +62,7 @@ Show the table to the user and ask which decide steps to register.
 For each approved decide step call `do_register` with `point_id`, `workflow`, `question`, `kind`,
 `options` (+ `option_help`), `context_fields`, `required_fields`, `rules`, `policy`,
 `irreversible`, `target_error`. Points start in `collect`: nothing is served yet, the agent decides.
-Private data: leave `remote_ok` empty until the user confirms (see `decideonce-workflow` §2).
+Private data: leave `remote_ok` empty until the user confirms (see section 2 of `decideonce-workflow`).
 
 ## 3. Write the workflow with the calls in place
 
@@ -79,12 +79,13 @@ baseline.
 ## 4. Let it learn itself
 
 - After the first labelled rows, `do_promote({point_id, phase: "shadow"})`: hosted Jev answers in
-  the background while the agent still decides; the threshold fits itself.
+  the background while the agent still decides; the threshold fits itself from the first 200
+  labelled shadow calls (collect rows don't count).
 - When `do_report` shows the gates passed, the user approves `serve` (or autopilot does it, if the
   user set up `[autopilot]` with limits; never edit that section yourself).
-- If hosted Jev is not good enough, `do_report` says `train_recommended`; then `do_train` trains a
-  small decision model on the agent's own labels and outcomes, and it must beat hosted Jev on a
-  paired comparison before it serves.
+- If hosted Jev is not good enough, `do_report` says `train_recommended`; then `do_train` launches
+  a Fireworks job that trains a small decision model on the agent's own labels and outcomes (there is
+  no local model path), and it must beat hosted Jev on a paired comparison before it serves.
 - In serve, audited cases come back to the agent; overrides and drift demote a point automatically.
 
 ## 5. What to tell the user

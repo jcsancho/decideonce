@@ -1,9 +1,32 @@
-"""Small-sample statistics: Wilson score bounds (95%, z=1.96)."""
+"""Small-sample statistics: Wilson score bounds (95%, z=1.96) plus the
+shared probability helpers (moved from probe.py in M12 P3)."""
 from __future__ import annotations
 
 import math
 
 Z95 = 1.96
+
+
+def softmax(logits: list[float]) -> list[float]:
+    m = max(logits)
+    e = [math.exp(x - m) for x in logits]
+    s = sum(e)
+    return [x / s for x in e]
+
+
+def mask_and_renorm(full: dict[str, float], allowed: list[str]) -> dict[str, float]:
+    """Masked softmax at inference: rule-removed options get 0, renormalise over allowed."""
+    vals = {o: max(full.get(o, 0.0), 0.0) for o in allowed}
+    s = sum(vals.values())
+    if s <= 0:
+        n = len(allowed)
+        return {o: 1.0 / n for o in allowed} if n else {}
+    return {o: v / s for o, v in vals.items()}
+
+
+def argmax(probs: dict[str, float], order: list[str]) -> str:
+    best = max(order, key=lambda o: (probs.get(o, 0.0), -order.index(o)))
+    return best
 
 
 def wilson_bounds(errors: int, n: int, z: float = Z95) -> tuple[float, float]:
@@ -23,6 +46,27 @@ def wilson_upper(errors: int, n: int, z: float = Z95) -> float:
 
 def wilson_lower(errors: int, n: int, z: float = Z95) -> float:
     return wilson_bounds(errors, n, z)[0]
+
+
+def ece(pairs: list[tuple[float, bool]], bins: int = 10) -> float | None:
+    """Expected calibration error over (confidence, correct) pairs.
+
+    Ten equal-width confidence bins; None when there are no pairs.
+    """
+    if not pairs or bins <= 0:
+        return None
+    n = len(pairs)
+    total = 0.0
+    for b in range(bins):
+        lo, hi = b / bins, (b + 1) / bins
+        in_bin = [(c, ok) for c, ok in pairs
+                  if (c > lo or (b == 0 and c == 0.0)) and c <= hi]
+        if not in_bin:
+            continue
+        acc = sum(1 for _, ok in in_bin if ok) / len(in_bin)
+        conf = sum(c for c, _ in in_bin) / len(in_bin)
+        total += len(in_bin) / n * abs(acc - conf)
+    return total
 
 
 def newcombe_paired(a: int, b: int, c: int, d: int, z: float

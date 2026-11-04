@@ -11,16 +11,23 @@ monotonic source (injectable on Service for tests).
 """
 from __future__ import annotations
 
-import calendar
 import fnmatch
 import hashlib
 import json
 import shlex
 import subprocess
+import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
+from . import fireworks_export as FE
+from . import hostedfit as HF
 from . import labels as L
+from . import stats as S
+from .fireworks_trainer import FireworksTrainer
+from .fireworks_worker import WorkerError, WorkerSession, WorkerUnavailable
+from .store import row_key as _row_key
+from .store import row_seq as _row_seq
 
 APPROVED_HASH_KEY = "autopilot_approved_hash"
 NOTIFIED_HASH_KEY = "autopilot_notified_hash"
@@ -29,17 +36,43 @@ APPROVED_AT_KEY = "autopilot_approved_at"
 APPROVED_NOTIFY_KEY = "autopilot_approved_notify"
 TRUST_FP_KEY = "autopilot_trust_fingerprint"
 TRUST_NOTIFIED_KEY = "autopilot_trust_notified"
-SIGNING_KEY_NAME = "DECIDE_AUTOPILOT_SIGNING_KEY"
+SIGNING_KEY_NAME = "DECIDEONCE_AUTOPILOT_SIGNING_KEY"
+SIGNING_KEY_NAME_LEGACY = "DECIDE_AUTOPILOT_SIGNING_KEY"  # pre-rename fallback
 SMOKE_DONE_AT_KEY = "autopilot_smoke_done_at"
 
 # G2: transient status() failures before a running job is declared lost.
 STATUS_LOST_AFTER = 3
+STALE_LAUNCH_S = 15 * 60
 # G5: backoff after a failed autopilot job before the next launch.
 FAIL_BACKOFF_S = 24 * 3600
 
 
 class JobRunning(Exception):
     """Another job is launching/running (G3 race lost)."""
+
+
+#: Worker calls per evaluation batch (GP6).
+EVAL_BATCH = 32
+#: Warming poll step while an eval session starts (cap: eval_ready_s).
+EVAL_READY_POLL_S = 0.2
+
+
+class _EvalAbort(Exception):
+    """Evaluation failed: the job becomes eval_failed with this error."""
+
+
+class _EvalCancel(Exception):
+    """Cancel won mid-evaluation: the thread exits quietly (the row is
+    already terminal)."""
+
+
+def _fmt_num(v, digits: int = 4) -> str:
+    if v is None:
+        return "?"
+    try:
+        return f"{float(v):.{digits}f}"
+    except (TypeError, ValueError, OverflowError):
+        return "?"
 
 # Main spec §7.3: the free-training confirmation only counts before
 # 2026-12-01 00:00 Pacific.
@@ -97,7 +130,10 @@ def effective_limits(cfg: dict) -> dict:
         "fireworks": {k: fw.get(k) for k in (
             "monthly_budget_usd", "allow_paid_training", "smoke_examples",
             "epochs", "train_price_per_mtok",
-            "eval_price_per_decision") if k in fw},
+            "eval_price_per_decision", "cookbook_dir", "cookbook_commit",
+            "batch_rows", "lora_rank", "learning_rate", "job_max_hours",
+            "worker_idle_min", "score_price_per_mtok", "reserve_usd",
+            "allow_session_serving") if k in fw},
     }
 
 
@@ -205,8 +241,6 @@ def _sign_message(project: str, eff_hash: str, approved_at: str) -> bytes:
 def sign_approval(raw_priv_32: bytes, project: str, eff_hash: str,
                   approved_at: str) -> str:
     """Base64 Ed25519 signature over project||hash||time."""
-    import base64
-
     from cryptography.hazmat.primitives.asymmetric.ed25519 import (
         Ed25519PrivateKey)
 
@@ -238,7 +272,7 @@ def verify_approval(b64_pub: str, b64_sig: str, project: str, eff_hash: str,
 def _parse_envsave_show(text: str, key_name: str) -> str | None:
     """Extract the secret from `envsave show` output, or None.
 
-    Real format (R3-1): `  DECIDE_AUTOPILOT_SIGNING_KEY = <secret>`.
+    Real format: `  DECIDEONCE_AUTOPILOT_SIGNING_KEY = <secret>`.
     Anything else fails loudly instead of decoding a prompt line.
     """
     import re as _re
@@ -295,6 +329,21 @@ def _read_envsave_secret(key_name: str, out, env_runner=None) -> str | None:
     if not secret:
         out(f"error: envsave show did not print '{key_name} = <secret>'")
         return None
+    return secret
+
+
+def _read_signing_secret(out, env_runner=None) -> str | None:
+    """Signing key from envsave: the new name first, then the pre-rename
+    fallback. Per-name failures stay silent; only a total miss reports."""
+    def _quiet(msg: str) -> None:
+        pass
+    secret = _read_envsave_secret(SIGNING_KEY_NAME, _quiet, env_runner)
+    if secret is None:
+        secret = _read_envsave_secret(SIGNING_KEY_NAME_LEGACY, _quiet,
+                                      env_runner)
+    if secret is None:
+        out(f"error: envsave has neither '{SIGNING_KEY_NAME}' nor "
+            f"'{SIGNING_KEY_NAME_LEGACY}'; run `decideonce autopilot keygen`")
     return secret
 
 
@@ -445,7 +494,7 @@ def run_approve(cfg: dict, store, *, is_tty: bool, out,
         return "error"
     out(f"trust key fingerprint: {fp}")
     project = (cfg.get("store", {}) or {}).get("project", "default")
-    secret = _read_envsave_secret(SIGNING_KEY_NAME, out, env_runner)
+    secret = _read_signing_secret(out, env_runner)
     if not secret:
         return "error"
     import base64
@@ -497,8 +546,11 @@ def _now_iso() -> str:
 
 
 def _parse_ts(s) -> float | None:
+    """Parse second- or microsecond-resolution UTC stamps (H2 mixes both)."""
+    if not isinstance(s, str):
+        return None
     try:
-        return float(calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ")))
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
     except (ValueError, TypeError):
         return None
 
@@ -535,6 +587,11 @@ class Autopilot:
     def __init__(self, svc):
         self.svc = svc
         self.checks_run = 0
+        # F8 background evaluation: live threads and their cancel flags
+        # by job_id, plus a worker-argv hook (tests inject FakeWorker).
+        self._eval_threads: dict[str, threading.Thread] = {}
+        self._eval_cancel: dict[str, threading.Event] = {}
+        self.worker_argv_fn = None
 
     # -- global state --------------------------------------------------
     @property
@@ -689,26 +746,25 @@ class Autopilot:
     def _shadow_gate(self, point: dict) -> str | None:
         """None when a decider exists for collect -> shadow, else a reason."""
         svc = self.svc
-        if not svc._legacy_mode and svc._hosted_tier(point):
+        if svc._hosted_tier(point):
             if svc._hosted_shadow_gate(point, "") is not None:
                 return "no_decider"
             if self._hosted_exhausted():
                 return "budget"
             return None
-        if not svc._legacy_mode:
-            # Private tier (private_model_only): a trained private model.
-            model = self.store.active_model(point["point_id"], "private")
-            if model is None or model.get("point_version") != point.get(
-                    "point_version", 1):
-                return "no_decider"
-            if getattr(svc.trainer, "needs_key", True) and not svc.fireworks_key:
-                return "no_decider"
-            if self._fireworks_headroom() is not None \
-                    and self._fireworks_headroom() <= 0:
-                return "budget"
-            return None
-        if svc._current_model(point) is None:
+        # Private tier (private_model_only): a trained private model.
+        model = self.store.active_model(point["point_id"], "private")
+        if model is None or model.get("point_version") != point.get(
+                "point_version", 1):
             return "no_decider"
+        if getattr(svc.trainer, "needs_key", True) and not svc.fireworks_key:
+            return "no_decider"
+        if not self.cfg.get("fireworks", {}).get("allow_session_serving",
+                                                 False):
+            return "serving_not_allowed"  # GP11: report + no auto-shadow
+        if self._fireworks_headroom() is not None \
+                and self._fireworks_headroom() <= 0:
+            return "budget"
         return None
 
     def _serve_gate(self, point: dict) -> str | None:
@@ -725,11 +781,7 @@ class Autopilot:
 
     def _training_trigger(self, point: dict) -> bool:
         if point.get("private_model_only"):
-            rows = L.labeled_rows(
-                self.store.decisions_for_point(point["point_id"]), point,
-                self.cfg["train"]["teacher_only_weight"],
-                self.cfg["extract"]["weight"])
-            return len(rows) >= self.cfg["train"]["min_train"]
+            return len(self._labeled(point)) >= self.cfg["train"]["min_train"]
         return bool(self.svc._train_reasons(point))
 
     def point_status(self, point: dict) -> tuple[str, str]:
@@ -763,7 +815,7 @@ class Autopilot:
                 promo = ("reason", "cooldown")
             elif point.get("irreversible", False):
                 promo = ("reason", "irreversible")
-            elif not self.svc._legacy_mode and self._hosted_exhausted() \
+            elif self._hosted_exhausted() \
                     and self.svc._hosted_tier(point):
                 promo = ("reason", "budget")
             else:
@@ -795,17 +847,30 @@ class Autopilot:
     def _model_unblocks(self, point: dict) -> bool:
         """True when training could produce the missing collect decider."""
         svc = self.svc
-        if svc._legacy_mode:
-            return svc._current_model(point) is None
         return point.get("private_model_only", False) \
             or (svc._effective_tier(point) == "private")
 
     # -- training dry-run / gates (pure: estimate computes, never uploads) --
     def _labeled(self, point: dict) -> list:
-        return L.labeled_rows(
+        from . import train as TR
+
+        labeled = L.labeled_rows(
             self.store.decisions_for_point(point["point_id"]), point,
             self.cfg["train"]["teacher_only_weight"],
             self.cfg["extract"]["weight"])
+        # Eval-only transcripts (pilot arm on held-out tickets) never train:
+        # their rows would leak the eval set.
+        eval_ids = self.store.eval_only_transcript_ids(point["workflow"])
+        if eval_ids:
+            labeled = [(r, lab, src, w) for r, lab, src, w in labeled
+                       if (r.get("transcript_id") or "") not in eval_ids]
+        # §15.3 gate: extracted rows join the export only while the point
+        # passes it.
+        if any(src == "extracted" for _, _, src, _ in labeled) \
+                and not TR.extraction_gate(self.cfg, self.store, point)["passed"]:
+            labeled = [(r, lab, src, w) for r, lab, src, w in labeled
+                       if src != "extracted"]
+        return labeled
 
     def join_candidates(self) -> list[dict]:
         """Points with >= min_train labelled rows (§7.2 step 1), with flags."""
@@ -835,21 +900,28 @@ class Autopilot:
 
         joins = self.join_candidates()
         rows: list[dict] = []
+        pts: dict[str, dict] = {}
         for j in joins:
             if not j["allowed"]:
                 continue  # §7.6: never exported, trained or sent
             p = self.store.get_point(j["point_id"])
             if p is None:
                 continue
-            for r, label, _src, weight in self._labeled(p):
+            pts[p["point_id"]] = p
+            for r, label, src, weight in self._labeled(p):
                 ctx = r.get("context")
                 rows.append({"point_id": p["point_id"], "ts": r.get("ts") or "",
                              "decision_id": r.get("decision_id") or "",
+                             "seq": r.get("seq"),
+                             "run_id": r.get("run_id"),
                              "context": ctx if isinstance(ctx, dict) else {},
-                             "label": label, "weight": weight})
-        rows.sort(key=lambda r: (r["ts"], r["decision_id"]))
+                             "label": label, "weight": weight,
+                             "source": src})
+        rows.sort(key=_row_key)
         rows = TR.split_rows(rows, self.cfg["train"]["holdout"],
                              self.cfg["train"].get("calib", 0.15))
+        # F5: estimate and upload see the rendered export rows (§0).
+        rows = [FE.render_export_row(pts[r["point_id"]], r) for r in rows]
         kind = "full" if self.store.smoke_done_exists() else "smoke"
         est = self.svc.trainer.estimate(rows, kind) if self.svc.trainer else {
             "estimate_usd": 0.0, "train_usd": 0.0, "eval_usd": 0.0,
@@ -891,16 +963,29 @@ class Autopilot:
 
     def _new_rows_ok(self, point: dict) -> bool:
         """min_new_rows labelled rows since the point's last train export."""
-        marker = (point.get("last_train_export_ts"),
-                  point.get("last_train_export_id"))
-        if not marker[0]:
+        if not point.get("last_train_export_ts"):
             return True  # first job: none needed
         try:
             need = int(self.section.get("min_new_rows", 100))
         except (TypeError, ValueError):
             need = 100
-        n = sum(1 for r, _lab, _src, _w in self._labeled(point)
-                if (r.get("ts") or "", r.get("decision_id") or "") > marker)
+        mseq = point.get("last_train_export_seq")
+        legacy = None
+        if not isinstance(mseq, int):
+            row = self.store.get_decision(
+                point.get("last_train_export_id") or "")
+            if row is not None and isinstance(row.get("seq"), int):
+                mseq = row["seq"]
+            else:
+                legacy = (point.get("last_train_export_ts"),
+                          point.get("last_train_export_id"))
+        n = 0
+        for r, _lab, _src, _w in self._labeled(point):
+            if legacy is not None:
+                after = (r.get("ts") or "", r.get("decision_id") or "") > legacy
+            else:
+                after = _row_seq(r) > mseq
+            n += after
         return n >= need
 
     def free_path_ok(self) -> bool:
@@ -1087,11 +1172,9 @@ class Autopilot:
 
     def _decider_line(self, point: dict) -> str:
         svc = self.svc
-        if not svc._legacy_mode and svc._hosted_tier(point):
+        if svc._hosted_tier(point):
             return "hosted Jev key + budget + remote_ok"
-        if not svc._legacy_mode:
-            return "trained private model"
-        return "trained probe"
+        return "trained private model"
 
     def _promote(self, point: dict, phase: str) -> dict:
         gates = self._gates_for_promote(point, phase)
@@ -1156,7 +1239,9 @@ class Autopilot:
         counted = self._counted_usd(dry)
         assert counted is not None  # point_status said ready
         try:
-            job = self.launch_job(point, dry, counted, autopilot=True)
+            job = self.launch_job(
+                point, dry, counted, autopilot=True,
+                free_train=dry["kind"] == "full" and self.free_path_ok())
         except JobRunning:
             return {"point_id": point["point_id"], "action": "train_skipped",
                     "reason": "job_running"}
@@ -1175,14 +1260,17 @@ class Autopilot:
                 "job_id": job["job_id"], "line": line}
 
     def launch_job(self, point: dict, dry: dict, counted: float,
-                   autopilot: bool) -> dict:
+                   autopilot: bool, idem: str | None = None,
+                   free_train: bool = False) -> dict:
         """Export allowed rows, upload and record a running job. Shared by
         manual do_train and autopilot (the callers passed their own gates).
 
         G1: a launching row with an idempotency key is written before the
         upload; a crash there reconciles on the next check (no silent
         duplicate). G3: the check-and-insert is one transaction plus the
-        unique partial index; the loser gets JobRunning.
+        unique partial index; the loser gets JobRunning. F4: the caller
+        may pass idem (do_train idem); two launchers with the same idem
+        share the one live job.
         """
         import sqlite3 as _sqlite3
         import uuid as _uuid
@@ -1197,16 +1285,24 @@ class Autopilot:
         joins = []
         for j in dry["joins"]:
             rs = [r for r in upload if r["point_id"] == j["point_id"]]
-            marker = max(((r["ts"], r["decision_id"]) for r in rs),
-                         default=("", ""))
+            latest = max(rs, key=_row_key, default=None)
             joins.append({**j, "n_upload": len(rs),
-                          "export_ts": marker[0], "export_id": marker[1]})
-        idem = _uuid.uuid4().hex
+                          "export_ts": latest["ts"] if latest else "",
+                          "export_id": latest["decision_id"]
+                          if latest else "",
+                          "export_seq": latest.get("seq")
+                          if latest else None})
+        idem = idem or _uuid.uuid4().hex
         temp_id = f"launching-{idem[:12]}"
+        # F8: the train ledger amount (0 when the free path covers the
+        # train part); counted_usd resets to it when evaluation ends.
+        train_ledger = 0.0 if (free_train and dry["kind"] == "full") \
+            else float(dry["estimate"].get("train_usd", 0))
         launching = {"job_id": temp_id, "kind": dry["kind"],
                      "status": "launching",
                      "estimate_usd": dry["estimate"]["estimate_usd"],
                      "counted_usd": counted, "spend_usd": 0.0,
+                     "train_usd": train_ledger,
                      "points": joins, "autopilot": autopilot,
                      "created_at": _now_iso(), "idempotency_key": idem}
         try:
@@ -1216,7 +1312,7 @@ class Autopilot:
         except _sqlite3.IntegrityError:
             raise JobRunning()
         try:
-            remote_id = self.svc.trainer.launch(upload, dry["kind"])
+            remote_id = self.svc.trainer.launch(upload, dry["kind"], idem)
         except Exception:
             self.store.job_update(temp_id, {"status": "failed",
                                             "error": "launch failed",
@@ -1228,12 +1324,36 @@ class Autopilot:
         return self.store.job_get(remote_id) or {**launching, "job_id": remote_id,
                                                  "status": "running"}
 
+    def _launch_stale(self, job: dict) -> bool:
+        """A launching row older than the claim window (GP2: 15 min)."""
+        ts = _parse_ts(job.get("created_at"))
+        if ts is None:
+            return True
+        return time.time() - ts >= STALE_LAUNCH_S
+
     def reconcile_launching(self) -> list[dict]:
-        """G1: adopt or fail stale launching rows (crash between insert and
-        claim). With no live trainer the remote state is unknown, so mark
-        failed with backoff (no spend: nothing was confirmed uploaded)."""
+        """G1/F4: adopt or fail stale launching rows (crash between insert
+        and claim). Young rows are left alone; a stale row is adopted when
+        a job still runs (or finished) under its idem, else failed. A
+        status check that errors leaves the row: absence must be certain,
+        and with no live trainer the remote state is unknown, so those
+        fail (no spend: nothing was confirmed uploaded)."""
         out = []
         for job in self.store.jobs_launching():
+            if not self._launch_stale(job):
+                continue
+            idem = job.get("idempotency_key") or ""
+            adopted = False
+            if idem and self.svc.trainer is not None:
+                try:
+                    st = self.svc.trainer.status(idem)
+                except Exception:
+                    continue  # uncertain: absence must be proven
+                if st.get("status") in ("running", "done"):
+                    adopted = self.store.job_claim_launch(
+                        job["job_id"], idem, idem)
+            if adopted:
+                continue
             self.store.job_update(job["job_id"], {"status": "failed",
                                                   "error": "crashed during launch",
                                                   "failed_at": _now_iso()})
@@ -1241,14 +1361,41 @@ class Autopilot:
                                            "crashed during launch"))
         return out
 
+    def _recover_done(self) -> list[dict]:
+        """F4: re-run the tails of done jobs that crashed between mark_done
+        and store. The tail is idempotent (conditional spend, job-tagged
+        models); a tail that still cannot run waits for the next poll."""
+        out = []
+        if self.svc.trainer is None:
+            return out
+        for job in self.store.jobs_done_unfinalized():
+            try:
+                st = self.svc.trainer.status(job["job_id"])
+            except Exception:
+                continue
+            try:
+                self._finalize_tail(
+                    job, st, self.store.job_get_eval(job["job_id"]))
+            except Exception:
+                continue
+            trigger = (job.get("points") or [{}])[0].get("point_id", "")
+            out.append({"point_id": trigger, "action": "finalize_recovered",
+                        "job_id": job["job_id"]})
+        return out
+
     def poll_and_finalize(self) -> list[dict]:
         """Poll running jobs; finalize finished ones. Returns actions."""
         out = []
         for rec in self.reconcile_launching():
             out.append(rec)
+        for rec in self._recover_done():
+            out.append(rec)
+        self._reap_eval_threads()
         if self.svc.trainer is None:
             return out
         for job in self.store.jobs_running():
+            if job["status"] == "evaluating":
+                continue  # F8: owned by its eval thread, not the poll
             try:
                 st = self.svc.trainer.status(job["job_id"])
             except KeyError:
@@ -1270,15 +1417,33 @@ class Autopilot:
             if st.get("status") == "running":
                 continue
             if st.get("status") == "failed":
-                self._mark_failed(job, st.get("error", "failed"))
+                self._mark_failed(job, st.get("error", "failed"),
+                                  st.get("account_id"))
                 out.append(self._failed_action(
-                    job, st.get("error", "failed")))
+                    job, st.get("error", "failed"),
+                    account_id=st.get("account_id")))
+                continue
+            if st.get("status") != "done":
+                # Trainer-cancelled behind our back: terminal, never
+                # finalized (no backoff: a cancel is not a failure).
+                self._mark_cancelled(job)
+                trigger = (job.get("points") or [{}])[0].get("point_id", "")
+                out.append({"point_id": trigger, "action": "train_cancelled",
+                            "job_id": job["job_id"]})
+                continue
+            if job["kind"] == "full" and isinstance(
+                    self.svc.trainer, FireworksTrainer):
+                out.append(self._start_evaluation(job))
                 continue
             out.append(self._finalize_job(job, st))
         return out
 
-    def _mark_failed(self, job: dict, error: str) -> None:
+    def _mark_failed(self, job: dict, error: str,
+                     account_id: str | None = None) -> None:
         """G5: fail a job, record its estimated spend, stamp backoff time."""
+        from .trainer_log import redact_account
+
+        error = redact_account(error, account_id)
         self.store.job_update(job["job_id"], {"status": "failed",
                                               "error": error,
                                               "failed_at": _now_iso()})
@@ -1288,56 +1453,96 @@ class Autopilot:
             self.store.spend_add(month, "fireworks", counted)
             self.store.job_update(job["job_id"], {"spend_usd": counted})
 
-    def _failed_action(self, job: dict, error: str) -> dict:
+    def _failed_action(self, job: dict, error: str,
+                       action: str = "train_failed",
+                       account_id: str | None = None) -> dict:
+        from .trainer_log import redact_account
+
+        error = redact_account(error, account_id)
         trigger = (job.get("points") or [{}])[0].get("point_id", "")
-        base: dict = {"point_id": trigger, "action": "train_failed",
+        base: dict = {"point_id": trigger, "action": action,
                       "job_id": job["job_id"]}
         if not job.get("autopilot"):
             return base
         h = effective_hash(self.cfg)
-        line = (f"{trigger} training failed ({job['kind']} job "
-                f"{job['job_id']}): {error}; retry after 24 h backoff")
+        if action == "eval_failed":
+            line = (f"{trigger} evaluation failed (job {job['job_id']}): "
+                    f"{error}; do_train retry_eval to retry")
+        else:
+            line = (f"{trigger} training failed ({job['kind']} job "
+                    f"{job['job_id']}): {error}; retry after 24 h backoff")
         self.store.autopilot_log_add(
             {"ts": _now_iso(), "point_id": trigger,
-             "action": "train_failed", "gates": {"error": error},
+             "action": action, "gates": {"error": error},
              "config_hash": h})
         notify(self._notify_cmd_for(fallback_to_current=True), line)
         return {**base, "line": line}
 
     def _finalize_job(self, job: dict, st: dict) -> dict:
         trigger = (job.get("points") or [{}])[0].get("point_id", "")
-        month = _now_iso()[:7]
         if job["kind"] == "smoke":
             # G4: claim first; the loser records no spend.
             if not self.store.job_finalize(job["job_id"], "smoke_done"):
                 return {"point_id": trigger, "action": "finalize_skipped",
                         "job_id": job["job_id"]}
+        elif not self.store.job_finalize(job["job_id"], "done"):
+            return {"point_id": trigger, "action": "finalize_skipped",
+                    "job_id": job["job_id"]}
+        return self._finalize_tail(job, st)
+
+    def _finalize_tail(self, job: dict, st: dict,
+                       eval: dict | None = None) -> dict:
+        """Idempotent finalize tail (F4): models, atomic spend, log line.
+
+        Runs after the G4 claim and from recovery. Models are skipped
+        when this job's card is already active; spend settles exactly
+        once via job_record_spend_finalized. F8: evaluated jobs pass
+        their eval doc (per-point T/metrics instead of the checkpoint).
+        """
+        trigger = (job.get("points") or [{}])[0].get("point_id", "")
+        month = _now_iso()[:7]
+        if job["kind"] == "smoke":
             self.store.meta_put(SMOKE_DONE_AT_KEY, _now_iso())
             self._record_spend(job, month)
             metrics = st.get("metrics", {})
             if job.get("autopilot"):
                 return self._log_action(
                     trigger, "smoke_done",
-                    {"job_id": job["job_id"], **metrics},
+                    {"job_id": job["job_id"], **metrics,
+                     "recipe_temperature": st.get("recipe_temperature")},
                     f"{trigger} smoke job done ({job['job_id']}): "
-                    f"{metrics.get('n_train')} train rows, "
-                    f"{metrics.get('n_eval')} eval calls",
-                    estimate_usd=job.get("counted_usd"))
+                    f"{self._smoke_detail(st)}",
+                    estimate_usd=job.get("counted_usd"),
+                    account_id=st.get("account_id"))
             return {"point_id": trigger, "action": "smoke_done",
                     "job_id": job["job_id"]}
-        # G4: claim first; the loser saves no models and records no spend.
-        if not self.store.job_finalize(job["job_id"], "done"):
-            return {"point_id": trigger, "action": "finalize_skipped",
-                    "job_id": job["job_id"]}
-        ckpt = self.svc.trainer.checkpoint(job["job_id"])
-        per_point = (ckpt or {}).get("per_point", {})
+        if eval is not None:
+            per_point = eval.get("points", {})
+        else:
+            ckpt = self.svc.trainer.checkpoint(job["job_id"])
+            per_point = (ckpt or {}).get("per_point", {})
         for j in job.get("points", []):
             if not j.get("allowed", True) or not j.get("n_upload"):
                 continue
+            if eval is not None and j["point_id"] not in per_point:
+                continue  # unevaluated join: no card without evidence
             self._save_private_model(j, job, (per_point.get(j["point_id"]) or {}))
         self._record_spend(job, month)
-        metrics = st.get("metrics", {})
         if job.get("autopilot"):
+            if eval is not None:
+                return self._log_action(
+                    trigger, "trained",
+                    {"job_id": job["job_id"],
+                     "points": sorted(per_point),
+                     "eval_cost_usd": eval.get("eval_cost_usd"),
+                     "eval_tokens": eval.get("eval_tokens"),
+                     "accuracy": {p: m.get("accuracy")
+                                  for p, m in per_point.items()}},
+                    f"{trigger} trained (job {job['job_id']}): "
+                    f"{eval.get('summary', '')}",
+                    estimate_usd=job.get("counted_usd"),
+                    account_id=st.get("account_id"))
+            metrics = st.get("metrics", {})
             return self._log_action(
                 trigger, "trained",
                 {"job_id": job["job_id"], **metrics,
@@ -1345,14 +1550,445 @@ class Autopilot:
                 f"{trigger} trained (job {job['job_id']}): "
                 f"accuracy {metrics.get('accuracy')}, "
                 f"{metrics.get('n_train')} train rows",
-                estimate_usd=job.get("counted_usd"))
+                estimate_usd=job.get("counted_usd"),
+                account_id=st.get("account_id"))
         return {"point_id": trigger, "action": "trained",
                 "job_id": job["job_id"]}
 
+    @staticmethod
+    def _smoke_detail(st: dict) -> str:
+        """One-line smoke summary from fake or log-parsed metrics (F8)."""
+        metrics = st.get("metrics", {})
+        parts = []
+        if metrics.get("n_train") is not None:
+            parts.append(f"{metrics['n_train']} train rows")
+        if metrics.get("n_eval") is not None:
+            parts.append(f"{metrics['n_eval']} eval calls")
+        if metrics.get("eval_accuracy") is not None:
+            parts.append(f"eval acc {metrics['eval_accuracy']:.4f}")
+        if metrics.get("eval_loss") is not None:
+            parts.append(f"eval loss {metrics['eval_loss']:.4f}")
+        if st.get("recipe_temperature") is not None:
+            parts.append(f"T {st['recipe_temperature']}")
+        return ", ".join(parts) if parts else "no metrics"
+
+    # -- background evaluation (M11 F8, GP6) ----------------------------------
+    def _start_evaluation(self, job: dict) -> dict:
+        """Claim running -> evaluating and spawn the eval thread."""
+        trigger = (job.get("points") or [{}])[0].get("point_id", "")
+        if not self.store.job_begin_eval(job["job_id"]):
+            return {"point_id": trigger, "action": "finalize_skipped",
+                    "job_id": job["job_id"]}
+        self._spawn_eval_thread(job["job_id"])
+        return {"point_id": trigger, "action": "eval_started",
+                "job_id": job["job_id"]}
+
+    def retry_evaluation(self, job: dict) -> dict:
+        """Claim eval_failed -> evaluating and re-run the thread."""
+        trigger = (job.get("points") or [{}])[0].get("point_id", "")
+        if not self.store.job_retry_eval(job["job_id"]):
+            return {"point_id": trigger, "action": "finalize_skipped",
+                    "job_id": job["job_id"]}
+        self._spawn_eval_thread(job["job_id"])
+        return {"point_id": trigger, "action": "eval_started",
+                "job_id": job["job_id"]}
+
+    def _spawn_eval_thread(self, job_id: str) -> None:
+        self._eval_cancel[job_id] = threading.Event()
+        t = threading.Thread(target=self._run_evaluation, args=(job_id,),
+                             daemon=True, name=f"eval-{job_id[:12]}")
+        self._eval_threads[job_id] = t
+        t.start()
+
+    def join_eval(self, job_id: str, timeout: float | None = None) -> bool:
+        """Wait for a job's eval thread. True when none is alive."""
+        t = self._eval_threads.get(job_id)
+        if t is None:
+            return True
+        t.join(timeout)
+        if t.is_alive():
+            return False
+        self._eval_threads.pop(job_id, None)
+        self._eval_cancel.pop(job_id, None)
+        return True
+
+    def _reap_eval_threads(self) -> None:
+        for jid, t in list(self._eval_threads.items()):
+            if not t.is_alive():
+                self._eval_threads.pop(jid, None)
+                self._eval_cancel.pop(jid, None)
+
+    def _run_evaluation(self, job_id: str) -> None:
+        """Thread body: evaluate, or terminalize on any failure. Never
+        raises (a dead thread with status evaluating would wedge the
+        one-job lock until a restart)."""
+        try:
+            self._do_evaluation(job_id)
+        except _EvalCancel:
+            pass  # cancel won; the row is already terminal
+        except _EvalAbort as e:
+            try:
+                job = self.store.job_get(job_id)
+                if job is not None and job["status"] == "evaluating":
+                    self._eval_failed(job, str(e))
+            except Exception:
+                pass
+        except Exception as e:  # noqa: BLE001 - last resort, still terminal
+            try:
+                job = self.store.job_get(job_id)
+                if job is not None and job["status"] == "evaluating":
+                    self._eval_failed(job, f"eval crashed: {e}")
+            except Exception:
+                pass
+
+    def _eval_worker(self, model: str) -> WorkerSession:
+        argv = None
+        if self.worker_argv_fn is not None:
+            argv = self.worker_argv_fn(model)
+        return WorkerSession(
+            self.cfg, model, self.store.root / "jobs",
+            self.svc.fireworks_key or "", worker_argv=argv)
+
+    def _do_evaluation(self, job_id: str) -> None:
+        job = self.store.job_get(job_id)
+        if job is None or job["status"] != "evaluating":
+            return
+        st = self.svc.trainer.status(job_id)
+        if st.get("status") != "done":
+            raise _EvalAbort("trainer lost the job")
+        model = st.get("model")
+        if not model:
+            raise _EvalAbort("no promoted model in the job log")
+        recipe_t = st.get("recipe_temperature")
+        try:
+            splits = self.svc.trainer.eval_rows(job_id)
+        except Exception as e:
+            raise _EvalAbort(f"no eval rows: {e}")
+        calib = splits.get("calib", [])
+        held = splits.get("heldout", [])
+        cancel_ev = self._eval_cancel.get(job_id) or threading.Event()
+        sess = self._eval_worker(model)
+        try:
+            scored_c = self._eval_score(sess, job, calib, cancel_ev)
+            scored_h = self._eval_score(sess, job, held, cancel_ev)
+        finally:
+            sess.close()
+        self._raise_if_cancelled(job_id, cancel_ev)
+        uploads = {j["point_id"]: j.get("n_upload", 0)
+                   for j in job.get("points", [])}
+        total_up = sum(uploads.values())
+        train_ledger = float(job.get("train_usd") or 0)
+        per_point = {}
+        for pid in sorted({s[1] for s in scored_c + scored_h}):
+            c = [s for s in scored_c if s[1] == pid]
+            h = [s for s in scored_h if s[1] == pid]
+            share = (uploads.get(pid, 0) / total_up) if total_up else 0.0
+            per_point[pid] = self._eval_fit_point(
+                pid, c, h, recipe_t, model,
+                train_ledger * share, job.get("created_at", ""),
+                uploads.get(pid, 0))
+        unevaluated = sorted(
+            p for p in uploads if p not in per_point and uploads[p])
+        doc = {
+            "model": model, "recipe_temperature": recipe_t,
+            "points": per_point,
+            "eval_cost_usd": sum(m["eval_cost_usd"]
+                                 for m in per_point.values()),
+            "eval_tokens": sum(m["eval_tokens"] for m in per_point.values()),
+            "n_calib": len(scored_c), "n_heldout": len(scored_h),
+            "unevaluated": unevaluated,
+            "summary": "; ".join(
+                f"{p}: acc {_fmt_num(m.get('accuracy'))}, "
+                f"T {_fmt_num(m.get('temperature'))}"
+                for p, m in sorted(per_point.items())) or "no eval rows",
+            "finished_at": _now_iso(),
+        }
+        self.store.job_save_eval(job_id, doc)
+        self.store.job_update(job_id, {"counted_usd": train_ledger})
+        self._raise_if_cancelled(job_id, cancel_ev)
+        if not self.store.job_claim_evaluated(job_id):
+            return  # lost the race (cancel/retry/recovery claimed first)
+        self._finalize_tail(self.store.job_get(job_id), st, doc)
+
+    def _raise_if_cancelled(self, job_id: str,
+                            cancel_ev: threading.Event) -> None:
+        if cancel_ev.is_set():
+            raise _EvalCancel()
+        job = self.store.job_get(job_id)
+        if job is None or job["status"] != "evaluating":
+            raise _EvalCancel()
+
+    def _eval_score(self, sess: WorkerSession, job: dict, rows: list[dict],
+                    cancel_ev: threading.Event) -> list[tuple]:
+        """Score rows in batches of 32: [(row, pid, logprobs, label_idx)].
+
+        Each worker call settles immediately (spend_add); a batch that
+        would exceed the monthly budget aborts the eval (GP11: inside
+        the budget). Malformed rows abort loudly: eval rows come from
+        our own export, so anything else is corruption.
+        """
+        from .fireworks_worker import tokens_of as _toks
+
+        scored = []
+        if not rows:
+            return scored
+        fw = self.cfg.get("fireworks", {})
+        price = float(fw.get("score_price_per_mtok", 1.96))
+        try:
+            budget = float(fw.get("monthly_budget_usd") or 0)
+        except (TypeError, ValueError):
+            budget = 0.0
+        month = _now_iso()[:7]
+        for b in range(0, len(rows), EVAL_BATCH):
+            batch = rows[b:b + EVAL_BATCH]
+            self._raise_if_cancelled(job["job_id"], cancel_ev)
+            est = sum(_toks([r]) for r in batch) * price / 1e6
+            spent = self.store.spend_get(month, "fireworks")["usd"]
+            if budget <= 0 or spent + est > budget:
+                raise _EvalAbort(
+                    f"budget_exceeded: eval batch ${est:.4f} over "
+                    f"remaining ${max(budget - spent, 0.0):.4f}")
+            try:
+                out = self._eval_wait_ready(sess, batch, cancel_ev,
+                                            job["job_id"])
+            except WorkerError as e:
+                raise _EvalAbort(f"worker: {e}"[:200])
+            except WorkerUnavailable as e:
+                raise _EvalAbort(f"worker_{e.reason}")
+            lpss = out.get("logprobs")
+            if not isinstance(lpss, list) or len(lpss) != len(batch):
+                raise _EvalAbort("worker logprobs do not match rows")
+            toks = out.get("tokens_in")
+            if not isinstance(toks, (int, float)) or toks < 0:
+                toks = sum(_toks([r]) for r in batch)
+            actual = toks * price / 1e6
+            self.store.spend_add(month, "fireworks", actual)
+            denom = sum(_toks([r]) for r in batch) or 1
+            for r, lps in zip(batch, lpss):
+                pid, keys, y = self._eval_row_label(r)
+                if not isinstance(lps, list) or len(lps) != len(keys):
+                    raise _EvalAbort(
+                        "worker logprobs do not match options")
+                try:
+                    lps = [float(v) for v in lps]
+                except (TypeError, ValueError):
+                    raise _EvalAbort(
+                        "worker logprobs are not floats")
+                rt = _toks([r])
+                scored.append((r, pid, lps, y, actual * rt / denom,
+                               toks * rt / denom))
+        return scored
+
+    @staticmethod
+    def _eval_row_label(row: dict) -> tuple[str, list[str], int]:
+        """(point_id, option keys, label index) of one eval row."""
+        questions = row.get("questions")
+        if not isinstance(questions, dict) or len(questions) != 1:
+            raise _EvalAbort("eval rows must carry exactly one question")
+        pid, q = next(iter(questions.items()))
+        keys = list((q.get("criteria") or {}))
+        label = q.get("label")
+        if label not in keys:
+            raise _EvalAbort("eval row label is not an option")
+        return pid, keys, keys.index(label)
+
+    def _eval_wait_ready(self, sess: WorkerSession, batch: list[dict],
+                         cancel_ev: threading.Event, job_id: str) -> dict:
+        """score() through the warming window (bounded by eval_ready_s)."""
+        try:
+            cap = float(self.cfg.get("fireworks", {}).get("eval_ready_s",
+                                                           600))
+        except (TypeError, ValueError):
+            cap = 600.0
+        deadline = time.monotonic() + max(cap, 0.0)
+        while True:
+            try:
+                return sess.score(batch)
+            except WorkerUnavailable as e:
+                if e.reason != "warming":
+                    raise
+            self._raise_if_cancelled(job_id, cancel_ev)
+            if time.monotonic() >= deadline:
+                raise _EvalAbort(
+                    f"worker_warming_timeout after {cap:g}s")
+            time.sleep(EVAL_READY_POLL_S)
+
+    def _eval_fit_point(self, pid: str, calib: list[tuple],
+                        held: list[tuple], recipe_t: float | None,
+                        model: str, train_cost: float,
+                        created_at: str, n_upload: int) -> dict:
+        """Per-point T (GP4), §6.1 threshold and §7.2 step 4 metrics."""
+        point = self.store.get_point(pid)
+        target = float((point or {}).get("target_error")
+                       or self.cfg["serve"]["target_error"])
+        support = int(self.cfg["serve"]["min_auto_support"])
+        min_recall = float(self.cfg["serve"]["min_option_recall"])
+        items_c = [(lps, y) for (_r, _p, lps, y, _c, _t) in calib]
+        T, skipped = HF.fit_temperature_private(items_c, recipe_t or 1.0)
+        pairs = []
+        tops = []
+        labels = []
+        options: list[str] = []
+        for (_r, _p, lps, y, _c, _t) in held:
+            probs = S.softmax([v / T for v in lps])
+            top = max(range(len(probs)), key=probs.__getitem__)
+            tops.append(top)
+            labels.append(y)
+            pairs.append((max(probs), top == y))
+        if held:
+            r0 = held[0][0]
+            q0 = next(iter(r0["questions"].values()))
+            options = list((q0.get("criteria") or {}))
+        n_h = len(held)
+        errors = sum(1 for _, ok in pairs if not ok)
+        accuracy = (n_h - errors) / n_h if n_h else None
+        per_option = {}
+        for i, o in enumerate(options):
+            idx = [k for k, y in enumerate(labels) if y == i]
+            rec = sum(1 for k in idx if tops[k] == i) / len(idx) \
+                if idx else 0.0
+            pred = [k for k, t in enumerate(tops) if t == i]
+            prec = sum(1 for k in pred if labels[k] == i) / len(pred) \
+                if pred else 0.0
+            per_option[o] = {"recall": rec, "precision": prec,
+                             "n": len(idx)}
+        teacher_only = [o for o in options
+                        if per_option[o]["recall"] < min_recall
+                        or per_option[o]["n"] < 10]
+        macro = self._macro_f1(per_option, options)
+        maj = max(set(labels), key=labels.count) if labels else None
+        base_acc = (labels.count(maj) / n_h) if maj is not None else None
+        base_macro = self._majority_macro_f1(labels, options, maj)
+        threshold = HF.fit_threshold(pairs, target, support) if pairs \
+            else None
+        if threshold is not None:
+            at = [c for conf, c in pairs if conf >= threshold]
+            coverage = len(at) / len(pairs)
+            err_n = sum(1 for c in at if not c)
+            err_at = err_n / len(at)
+            wilson = S.wilson_upper(err_n, len(at))
+        else:
+            coverage, err_at, wilson = 0.0, None, None
+        sources: dict[str, int] = {}
+        for (r, _p, _l, _y, _c, _t) in calib + held:
+            src = r.get("source")
+            if src:
+                sources[src] = sources.get(src, 0) + 1
+        eval_cost = sum(c for (_r, _p, _l, _y, c, _t) in calib + held)
+        eval_toks = sum(t for (_r, _p, _l, _y, _c, t) in calib + held)
+        try:
+            job_min = max(0.0, (time.time() - _parse_ts(created_at)) / 60)
+        except (TypeError, ValueError):
+            job_min = None
+        return {
+            "threshold": threshold, "accuracy": accuracy,
+            "temperature": T,
+            "temperature_source": "recipe" if skipped else "fit",
+            "recipe_temperature": recipe_t,
+            "model_ref": model,
+            "eval_tokens": eval_toks, "eval_cost_usd": eval_cost,
+            "scoring": "session_forward",
+            "prompt_renderer": (
+                f"cookbook@{self.cfg['fireworks']['cookbook_commit']}"),
+            "metrics": {
+                "n_train": max(0, n_upload - len(calib) - len(held)),
+                "n_calib": len(calib), "n_holdout": n_h,
+                "label_sources": sources,
+                "accuracy": accuracy, "macro_f1": macro,
+                "baseline_accuracy": base_acc,
+                "baseline_macro_f1": base_macro,
+                "per_option": per_option,
+                "ece": S.ece(pairs),
+                "threshold": threshold, "coverage": coverage,
+                "error_at_threshold": err_at,
+                "error_at_threshold_wilson_upper": wilson,
+                "random_escalation_error":
+                    (1.0 - accuracy) if accuracy is not None else None,
+                "teacher_only_options": teacher_only,
+                "job_minutes": job_min,
+                "train_cost_usd": train_cost,
+                "eval_cost_usd": eval_cost,
+            },
+        }
+
+    @staticmethod
+    def _macro_f1(per_option: dict, options: list[str]) -> float | None:
+        if not options:
+            return None
+        f1s = []
+        for o in options:
+            p = per_option[o]["precision"]
+            r = per_option[o]["recall"]
+            f1s.append(2 * p * r / (p + r) if p + r > 0 else 0.0)
+        return sum(f1s) / len(f1s)
+
+    @staticmethod
+    def _majority_macro_f1(labels: list[int], options: list[str],
+                           maj: int | None) -> float | None:
+        if maj is None or not options:
+            return None
+        n = len(labels)
+        f1s = []
+        for i in range(len(options)):
+            if i == maj:
+                tp = labels.count(maj)
+                prec = tp / n
+                rec = 1.0
+            else:
+                prec, rec = 0.0, 0.0
+            f1s.append(2 * prec * rec / (prec + rec)
+                       if prec + rec > 0 else 0.0)
+        return sum(f1s) / len(f1s)
+
+    def _eval_failed(self, job: dict, error: str) -> dict:
+        """Terminalize a failed evaluation: the train part records, the
+        settled per-call spend stays, the old model stays, retry_eval
+        can retry. Spend finalizes exactly once (conditional)."""
+        from .trainer_log import redact_account
+
+        error = redact_account(error)
+        train = float(job.get("train_usd") or 0)
+        month = _now_iso()[:7]
+        self.store.job_update(job["job_id"], {"counted_usd": train})
+        self.store.job_record_spend_finalized(job["job_id"], train, month)
+        self.store.job_update(job["job_id"], {"status": "eval_failed",
+                                              "error": error,
+                                              "failed_at": _now_iso()})
+        # No thread-tracking cleanup here: a live thread may still be
+        # settling its in-flight call; join_eval and the poll reaper own
+        # that once the thread actually exits.
+        return self._failed_action(job, error, action="eval_failed")
+
+    def recover_interrupted_evals(self) -> list[dict]:
+        """Server startup (F9 wires it): jobs still evaluating died with
+        the old process; they become eval_failed (retryable)."""
+        return [self._eval_failed(job, "server_restart")
+                for job in self.store.jobs_evaluating()]
+
     def _record_spend(self, job: dict, month: str) -> None:
         counted = float(job.get("counted_usd", 0))
-        self.store.spend_add(month, "fireworks", counted)
-        self.store.job_update(job["job_id"], {"spend_usd": counted})
+        self.store.job_record_spend_finalized(job["job_id"], counted, month)
+
+    def _mark_cancelled(self, job: dict) -> None:
+        """F4: cancel a job: no relaunch, ever. Spend counts like a failure
+        (conservative: a cancelled job may already have billed)."""
+        if job.get("status") == "evaluating":
+            # F8: stop the eval thread; the train part records (it ran)
+            # and the settled per-call spend stays. Never the full
+            # counted estimate: the eval part would double-count.
+            ev = self._eval_cancel.get(job["job_id"])
+            if ev is not None:
+                ev.set()
+            train = float(job.get("train_usd") or 0)
+            month = _now_iso()[:7]
+            self.store.job_update(job["job_id"], {"counted_usd": train})
+            self.store.spend_add(month, "fireworks", train)
+            self.store.job_update(job["job_id"], {"status": "cancelled",
+                                                  "spend_usd": train,
+                                                  "error": "cancelled by user"})
+            return
+        self._mark_failed(job, "cancelled by user")
+        self.store.job_update(job["job_id"], {"status": "cancelled"})
 
     def _save_private_model(self, join: dict, job: dict, model: dict) -> None:
         """Model card file + active kind=private model + export marker."""
@@ -1361,6 +1997,12 @@ class Autopilot:
         point = self.store.get_point(join["point_id"])
         if point is None:
             return
+        cur = self.store.active_model(join["point_id"], "private")
+        if cur is not None and cur.get("card", {}).get("job_id") == job["job_id"]:
+            return  # F4: recovery re-run; this job's card is already active
+        pending = point.get("pending_private_model") or {}
+        if pending.get("job_id") == job["job_id"]:
+            return  # F9: recovery re-run; this job's card is already pending
         ver = point.get("point_version", 1)
         dest = self.store.models_dir / point["point_id"]
         dest.mkdir(parents=True, exist_ok=True)
@@ -1371,20 +2013,54 @@ class Autopilot:
                 "kind": "private", "job_id": job["job_id"],
                 "threshold": model.get("threshold"),
                 "accuracy": model.get("accuracy"),
-                "hint_map": model.get("hint_map", {}),
-                "sampler": f"fakeckpt:{job['job_id']}",
                 "export_ts": join.get("export_ts", ""),
                 "export_decision_id": join.get("export_id", ""),
+                "export_seq": join.get("export_seq"),
                 "n_upload": join.get("n_upload", 0)}
+        if model.get("scoring") == "session_forward":
+            # F8 eval card (§7.2 step 4): the full name stays in
+            # model_ref (reports print the redacted form, GP9/F9).
+            ref = model.get("model_ref") or ""
+            card.update({
+                "model_ref": ref,
+                "model_tail": ref.rsplit("/", 1)[-1],
+                "temperature": model.get("temperature"),
+                "temperature_source": model.get("temperature_source"),
+                "recipe_temperature": model.get("recipe_temperature"),
+                "metrics": model.get("metrics", {}),
+                "scoring": "session_forward",
+                "prompt_renderer": model.get("prompt_renderer"),
+                "eval_tokens": model.get("eval_tokens"),
+                "eval_cost_usd": model.get("eval_cost_usd")})
+        else:
+            # Fake-era card (offline gate tests pin this shape).
+            card["hint_map"] = model.get("hint_map", {})
+            card["sampler"] = f"fakeckpt:{job['job_id']}"
         (dest / f"v{ver}-{n}.json").write_text(_json.dumps(card, indent=1))
-        self.store.save_model(point["point_id"], ver, "private",
-                              f"v{ver}-{n}.json", card)
+        # F9 (§7.2 step 5): a serve-phase private-tier point keeps
+        # answering with its current checkpoint; the new card waits as
+        # pending until §6.4 holds for it and the user confirms. Every
+        # other phase/tier switches at once.
+        serve_private = point.get("phase") == "serve" \
+            and self.svc._effective_tier(point) == "private"
+        mid = self.store.save_model(point["point_id"], ver, "private",
+                                    f"v{ver}-{n}.json", card,
+                                    active=not serve_private)
+        if serve_private:
+            point["pending_private_model"] = {"model_id": mid,
+                                              "job_id": job["job_id"]}
         point["last_train_export_ts"] = join.get("export_ts", "")
         point["last_train_export_id"] = join.get("export_id", "")
+        point["last_train_export_seq"] = join.get("export_seq")
         self.store.put_point(point)
 
     def _log_action(self, point_id: str, action: str, gates: dict,
-                    line: str, estimate_usd=None) -> dict:
+                    line: str, estimate_usd=None,
+                    account_id: str | None = None) -> dict:
+        from .trainer_log import redact_account, redact_obj
+
+        line = redact_account(line, account_id)
+        gates = redact_obj(gates, account_id)
         h = effective_hash(self.cfg)
         entry: dict = {"ts": _now_iso(), "point_id": point_id,
                        "action": action, "gates": gates, "config_hash": h}

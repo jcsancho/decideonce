@@ -6,8 +6,17 @@ from collections import Counter
 
 from . import gateway as GW
 from . import labels as L
-from . import probe as P
 from . import stats as S
+
+
+def _is_legacy_row(r: dict) -> bool:
+    """Pre-M12 rows: a zero-shot distribution (tiered code never writes
+    one), or stored probe probabilities with no tiered decider/hosted
+    fields (private-tier rows carry decider="private")."""
+    if r.get("jev_zero_shot"):
+        return True
+    return (r.get("probe") is not None and r.get("decider") is None
+            and r.get("hosted") is None)
 
 
 def _agreement(rows: list[dict], options: list[str], key: str) -> dict:
@@ -20,7 +29,7 @@ def _agreement(rows: list[dict], options: list[str], key: str) -> dict:
         if teacher is None or not dist:
             continue
         allowed = r.get("allowed_options") or options
-        top = P.argmax(P.mask_and_renorm(dist, allowed), allowed)
+        top = S.argmax(S.mask_and_renorm(dist, allowed), allowed)
         n += 1
         if top == teacher:
             agree += 1
@@ -114,15 +123,18 @@ def point_report(cfg: dict, store, point: dict, serve_checks: dict | None = None
         1 for r in rows if L.resolve_label(r)[1] == "outcome_bad_no_fix")
     excluded_bad = sum(1 for r in rows if L.resolve_label(r)[1] == "outcome_bad_no_fix")
 
-    model = store.active_model(point["point_id"], "probe")
-    card = model["card"] if model else {}
+    # P4: kind probe/plan model rows are ignored, not deleted: old cards
+    # never set the threshold, coverage or evidence pool again.
+    model = None
+    card: dict = {}
     threshold = card.get("threshold")
+    legacy_n = sum(1 for r in rows if _is_legacy_row(r))
 
     audits = [r for r in rows if r.get("audit") and r.get("teacher_choice")]
     audit_errs = 0
     for r in audits:
         probs = (r.get("probe") or {}).get("probabilities") or r.get("jev_zero_shot") or {}
-        if probs and P.argmax(P.mask_and_renorm(probs, r.get("allowed_options") or options),
+        if probs and S.argmax(S.mask_and_renorm(probs, r.get("allowed_options") or options),
                               r.get("allowed_options") or options) != r["teacher_choice"]:
             audit_errs += 1
 
@@ -152,6 +164,10 @@ def point_report(cfg: dict, store, point: dict, serve_checks: dict | None = None
     pool_e = int(round(float(card.get("error_at_threshold") or 0.0) * pool_n)) if pool_n else 0
     gw = (_gateway_section(cfg, store, point, rows, modes)
           if point.get("source") == "gateway" else None)
+    # S8.4: a rejected do_record is a rule violation only on a point with
+    # rules; on a rule-less point it is an invalid choice, counted apart.
+    _bad_records = sum(1 for r in rows if r.get("rule_violation"))
+    _has_rules = bool(point.get("rules"))
     rep = {
         "point_id": point["point_id"],
         "workflow": point["workflow"],
@@ -164,6 +180,7 @@ def point_report(cfg: dict, store, point: dict, serve_checks: dict | None = None
         "data_class": point.get("data_class", "private"),
         "irreversible": bool(point.get("irreversible", False)),
         "rows": len(rows),
+        "legacy_rows": legacy_n,
         "rows_by_mode": dict(modes),
         "rows_by_source": dict(sources),
         "label_sources": dict(label_sources),
@@ -182,7 +199,8 @@ def point_report(cfg: dict, store, point: dict, serve_checks: dict | None = None
                         if audits else None},
         "overrides": sum(1 for r in rows if r.get("override")),
         "rule_hits": dict(rule_hits),
-        "rule_violations": sum(1 for r in rows if r.get("rule_violation")),
+        "rule_violations": _bad_records if _has_rules else 0,
+        "invalid_choices": 0 if _has_rules else _bad_records,
         "rule_violations_in_run": sum(1 for r in rows if r.get("rule_violation_in_run")),
         "teacher_unreliable": unreliable,
         "teacher_disagreement": {"disagree": disagree, "n": both},
@@ -197,8 +215,8 @@ def point_report(cfg: dict, store, point: dict, serve_checks: dict | None = None
                   "demotions": len(drift_events),
                   "recent_audits": {"errors": sum(
                       1 for r in recent
-                      if ((r.get("probe") or {}).get("probabilities") and P.argmax(
-                          P.mask_and_renorm((r["probe"])["probabilities"],
+                      if ((r.get("probe") or {}).get("probabilities") and S.argmax(
+                          S.mask_and_renorm((r["probe"])["probabilities"],
                                             r.get("allowed_options") or options),
                           r.get("allowed_options") or options) != r["teacher_choice"])),
                       "n": len(recent), "window": window}},
@@ -226,6 +244,34 @@ def render_autopilot_md(block: dict) -> str:
     lines.append(f"- approved: {ap} | current: {cu}")
     for a in block.get("actions", []):
         lines.append(f"- {a.get('ts', '')} {a.get('line', '')}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_fireworks_md(fw: dict) -> str:
+    """The Fireworks-global block between autopilot and points (F9). Pure."""
+    lines = ["# Fireworks", ""]
+    cur = (fw or {}).get("current_job")
+    if cur:
+        lines.append(f"- job {cur['job_id']} ({cur['kind']}, {cur['state']})"
+                     + (f" | step {cur['step']}" if cur.get("step") is not None else "")
+                     + (f" | loss {cur['loss']:.4f}" if cur.get("loss") is not None else "")
+                     + (f" | eval acc {cur['eval_accuracy']}" if cur.get("eval_accuracy") is not None else ""))
+    else:
+        lines.append("- train job: none")
+    pin = (fw or {}).get("pin") or {}
+    lines.append(f"- cookbook pin: {pin.get('status', 'unknown')}")
+    lines.append("- serving: "
+                 + ("allowed" if (fw or {}).get("serving_allowed") else
+                    "gated (allow_session_serving + budget)"))
+    sess = ((fw or {}).get("worker") or {}).get("sessions") or {}
+    if sess:
+        def _st(st: dict) -> str:
+            if st.get("ready"):
+                return "ready"
+            return "starting" if st.get("running") else "down"
+        lines.append("- worker: " + ", ".join(
+            f"{m} ({_st(st)})" for m, st in sorted(sess.items())))
     lines.append("")
     return "\n".join(lines)
 
@@ -305,9 +351,33 @@ def render_md(reports: list[dict]) -> str:
                              f"(n_fit={pf['n_fit']}, kinds={pf['fit_label_kinds']}); "
                              f"evidence {pf['evidence_comparisons']} "
                              f"(kinds={pf['evidence_label_kinds']})")
+        pv = rep.get("private")
+        if pv:
+            lines.append(
+                f"- private: {pv['calls_month']} calls, ${pv['spend_month_usd']:.4f} / "
+                f"${pv['budget_usd']:.2f} this month"
+                + (" **WARNING: over 80% of budget**" if pv["budget_warning_80"] else "")
+                + f" | median latency {_s(pv['median_latency_s'])} | warming "
+                + f"{pv['warming']} | errors "
+                + ", ".join(f"{k} {v}" for k, v in sorted(pv["errors"].items()))
+                + " (unmeasured)")
+            m = pv["model"]
+            if m:
+                lines.append(f"- private model: {m['model']}, T={m['temperature']}, "
+                             f"held-out acc={m['accuracy']} (n={m['n_holdout']}), "
+                             f"threshold={m['threshold']} (job {m['job_id']})")
+            pm = pv["pending_model"]
+            if pm:
+                lines.append(f"- pending checkpoint: {pm['model']} (job {pm['job_id']}), "
+                             "awaiting §6.4 + confirm")
+            if pv.get("blocked"):
+                lines.append(f"- blocked({pv['blocked']})")
         lines.append(f"- rows: {rep['rows']} (modes: "
                      + ", ".join(f"{k} {v}" for k, v in sorted(rep["rows_by_mode"].items()))
                      + ")")
+        if rep.get("legacy_rows"):
+            lines.append(f"- legacy: {rep['legacy_rows']} pre-M12 rows "
+                         f"(shown, never evidence)")
         lines.append("- label sources: "
                      + (", ".join(f"{k} {v}" for k, v in sorted(rep["label_sources"].items()))
                         or "none"))
@@ -325,7 +395,8 @@ def render_md(reports: list[dict]) -> str:
         lines.append(f"- audit error: {ae['errors']}/{ae['n']} "
                      f"({_pct(ae['rate'])}; Wilson upper {_pct(ae['wilson_upper'])})")
         lines.append(f"- overrides: {rep['overrides']} | rule hits: {rep['rule_hits']} | "
-                     f"rule violations: {rep['rule_violations']}")
+                     f"rule violations: {rep['rule_violations']} | "
+                     f"invalid choices: {rep['invalid_choices']}")
         if rep["teacher_unreliable"]:
             lines.append(f"- **teacher_unreliable**: {rep['teacher_disagreement']}")
         sv = rep["saved"]
@@ -386,11 +457,8 @@ def workflow_report(cfg: dict, store, workflow: str) -> dict:
             rejected.update(full.get("rejected_codes") or {})
             disagreements.extend(full.get("disagreements") or [])
     gates = {p["point_id"]: TR.extraction_gate(cfg, store, p) for p in points}
-    cards = {}
-    for p in points:
-        model = (store.active_model(p["point_id"], "plan")
-                 or store.active_model(p["point_id"], "probe"))
-        cards[p["point_id"]] = model["card"] if model else {}
+    # P4: kind probe/plan model rows are ignored, not deleted.
+    cards = {p["point_id"]: {} for p in points}
 
     plans = store.plans_for_workflow(workflow)
     real = [p for p in plans if not p.get("pilot_forced")]

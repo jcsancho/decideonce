@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import gzip
+import hmac
 import http.client
 import ipaddress
 import json
@@ -25,14 +26,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import gwformat as GF
 from . import gwtemplate as GT
 from . import hostedfit as HF
-from . import probe as P
 from . import render as R
 from . import rules as RU
 from . import stats as S
 from .config import data_root, load_config
 from .deciders import DeciderError
-from .deciders.hosted import record_hosted_error
-from .jev import JevError
+from .deciders.base import record_decider_error
 from .store import Store
 
 try:
@@ -51,7 +50,9 @@ MAX_BODY = 10 * 1024 * 1024
 
 
 def _utcnow() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 class GatewayError(Exception):
@@ -270,7 +271,7 @@ def synth_openai(text: str, model: str) -> dict:
                                                 "refusal": None},
                          "logprobs": None, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            "system_fingerprint": "decide-gateway"}
+            "system_fingerprint": "decideonce-gateway"}
 
 
 def synth_openai_stream(text: str, model: str, include_usage: bool) -> list[bytes]:
@@ -405,26 +406,20 @@ def guard_fields_of(point: dict) -> set[str]:
 # --------------------------------------------------------------------------
 
 class Gateway:
-    def __init__(self, cfg: dict, store, jev, rng: random.Random | None = None):
+    def __init__(self, cfg: dict, store, deciders: dict,
+                 rng: random.Random | None = None, trainer=None,
+                 fireworks_key: str | None = None):
         self.cfg = cfg
         self.store = store
-        if isinstance(jev, dict):
-            self.deciders = jev
-            self.jev = None
-            for d in jev.values():
-                raw = getattr(d, "jev", None)
-                if raw is not None:
-                    self.jev = raw
-                    break
-        else:
-            self.jev = jev
+        self.deciders = deciders
         self.rng = rng or random.Random()
         self.port = cfg["gateway"]["port"]
         self._jev_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
         self._ssl = ssl.create_default_context()
         self._last_purge = 0.0
         from .service import Service
-        self.svc = Service(cfg, store, jev, rng=self.rng)
+        self.svc = Service(cfg, store, deciders, rng=self.rng,
+                           trainer=trainer, fireworks_key=fireworks_key)
 
     # -- decider call with timeout -----------------------------------------
     def _decide_call(self, decider, req):
@@ -434,7 +429,7 @@ class Gateway:
         decider timeout, so the decider's own timeout always fires first
         (releasing its reservation and mapping cleanly); a pool timeout
         surfaces as DeciderError("timeout") so it is counted as
-        hosted_error_timeout. R2-6: the local probe keeps a single timeout.
+        hosted_error_timeout. Other deciders keep a single timeout.
         """
         from .deciders.hosted import HostedJevDecider
 
@@ -536,7 +531,6 @@ class Gateway:
             return self._forward_logged(route, req, point, t0, raw_body, context=context,
                                         state_text=state_text, allowed=allowed,
                                         rule_hits=rule_hits, warnings=warnings)
-        options = list(point["options"])
         decider = self.svc._decider_for(point)
         if decider is None:
             # tiered collect/paused (or a tier without a decider): forward
@@ -546,31 +540,17 @@ class Gateway:
                                         allowed=allowed, rule_hits=rule_hits,
                                         warnings=warnings)
         try:
-            model_row = self.svc._current_model(point)
             dreq = self.svc._decide_request(point, context,
                                             state_text=state_text)
-            if not self.svc._legacy_mode:
-                dreq = self._gateway_request(point, context, dreq)
+            dreq = self._gateway_request(point, context, dreq)
             res = self._decide_call(decider, dreq)
             hosted_field: dict | None = None
             decider_tag: str | None = None
-            if self.svc._legacy_mode:
-                if res._hidden is not None and point.get("phase") in (
-                        "shadow", "serve"):
-                    from . import train as TR
-                    TR.cache_vector(self.store, point, state_text, res._hidden)
-                zs_full = res._zs_full or {}
-                probe_full = res._probe_full
-                shown_full: dict = res.probs
-                probe_field: dict | None = (
-                    {"model_version": model_row["card"].get("model_version"),
-                     "probabilities": probe_full}
-                    if probe_full is not None else None)
-            elif res.decider == "private":
+            if res.decider == "private":
                 probe_field = {"model_version": res.model,
                                "probabilities": res.probs}
                 decider_tag = res.decider
-                zs_full, shown_full = {}, res.probs
+                zs_full, shown_full = None, res.probs
             else:
                 hosted_field = {
                     "model": res.model, "probabilities": res.probs,
@@ -579,29 +559,28 @@ class Gateway:
                 tmp: dict = {}
                 self.svc._maybe_store_private(point, dreq, tmp)
                 probe_field = tmp.get("probe")
-                zs_full, shown_full = {}, res.probs
+                zs_full, shown_full = None, res.probs
                 if res.warnings:
                     warnings = warnings + list(res.warnings)
             jev_seconds = res.seconds
-        except (JevError, DeciderError) as e:
+        except DeciderError as e:
             tag = "jev_unavailable"
-            if not self.svc._legacy_mode and isinstance(e, DeciderError):
-                record_hosted_error(self.store, point["point_id"], e)
-                tag = {"budget_exceeded": "budget_exceeded",
-                       "no_key": "no_hosted_jev_key"}.get(e.code, tag)
+            record_decider_error(self.store, decider, point["point_id"], e)
+            tag = {"budget_exceeded": "budget_exceeded",
+                   "no_key": "no_hosted_jev_key"}.get(e.code, tag)
             self.store.counter_inc("jev_unavailable", point["point_id"])
             return self._forward_logged(route, req, point, t0, raw_body,
                                         warnings=warnings + [tag],
                                         context=context, state_text=state_text,
                                         allowed=allowed, rule_hits=rule_hits)
-        if (not self.svc._legacy_mode and decider_tag == "hosted_jev"
+        if (decider_tag == "hosted_jev"
                 and self.svc._hosted_tier(point)):
             shown = HF.mask_temper(shown_full, allowed,
                                    self.svc._hosted_temperature(point))
         else:
-            shown = P.mask_and_renorm(shown_full, allowed)
+            shown = S.mask_and_renorm(shown_full, allowed)
         confidence = max(shown.values())
-        top = P.argmax(shown, allowed)
+        top = S.argmax(shown, allowed)
         if point.get("phase") != "serve":
             return self._forward_logged(route, req, point, t0, raw_body, context=context,
                                         state_text=state_text, allowed=allowed,
@@ -876,7 +855,7 @@ def check_upstream_path(upath: str) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "decide-gateway/0.1"
+    server_version = "decideonce-gateway/0.1"
     protocol_version = "HTTP/1.1"
     gateway: Gateway  # set by serve()
 
@@ -896,7 +875,7 @@ class Handler(BaseHTTPRequestHandler):
         presented = self.headers.get("x-decideonce-token")
         if presented is None:  # M15 compat: old header accepted
             presented = self.headers.get("x-decide-token")
-        if token and presented != token:
+        if token and not hmac.compare_digest(str(presented or ""), token):
             raise GatewayError(403, "forbidden_token", "bad or missing x-decideonce-token")
 
     def _read_body(self) -> bytes:
@@ -919,7 +898,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _handle(self) -> None:
-        gw = self.gateway
         try:
             self._guard()
         except GatewayError as e:
@@ -1249,30 +1227,34 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
 
-def serve(cfg=None, jev=None, rng=None, block=True):
+def serve(cfg=None, deciders=None, rng=None, block=True):
     """Start the gateway. Returns (server, thread) when block=False (tests)."""
-    from .config import ConfigError
     cfg = cfg or load_config()
     check_gateway_local(cfg["gateway"]["host"])
-    if jev is not None:
-        gw = Gateway(cfg, Store(data_root(cfg)), jev, rng=rng)
+    if deciders is not None:
+        gw = Gateway(cfg, Store(data_root(cfg)), deciders, rng=rng)
     else:
         from .deciders import build_deciders
+        from .deciders.hosted import resolve_key
+        from .trainer import build_live_trainer
         store = Store(data_root(cfg))
         deciders, _ = build_deciders(cfg, store)
-        gw = Gateway(cfg, store, deciders, rng=rng)
+        fw_key = resolve_key(cfg.get("fireworks", {}).get("key_ref", ""))
+        trainer, _ = build_live_trainer(cfg, store, fw_key)
+        gw = Gateway(cfg, store, deciders, rng=rng, trainer=trainer,
+                     fireworks_key=fw_key)
     try:
         server = ThreadingHTTPServer((cfg["gateway"]["host"], cfg["gateway"]["port"]),
                                      Handler)
     except OSError as e:
-        print(f"decide-gateway: cannot bind: {e}", file=sys.stderr)
+        print(f"decideonce-gateway: cannot bind: {e}", file=sys.stderr)
         raise SystemExit(1)
     server.daemon_threads = True
     server.gateway = gw
     Handler.gateway = gw
     gw.server_port = server.server_address[1]
     if block:
-        print(f"decide-gateway on http://{cfg['gateway']['host']}:{gw.server_port} "
+        print(f"decideonce-gateway on http://{cfg['gateway']['host']}:{gw.server_port} "
               f"(openai/anthropic)", flush=True)
         try:
             server.serve_forever()
@@ -1285,11 +1267,19 @@ def serve(cfg=None, jev=None, rng=None, block=True):
 
 
 def main() -> None:
+    import argparse
+
+    argparse.ArgumentParser(
+        prog="decideonce-gateway",
+        description="DecideOnce zero-edit gateway: an OpenAI/Anthropic-"
+                    "compatible endpoint that answers approved calls itself. "
+                    "Host and port come from [gateway] in decideonce.toml. "
+                    "With no arguments, starts the gateway.").parse_args()
     from .config import ConfigError
     try:
         serve()
     except ConfigError as e:
-        print(f"decide-gateway: refusing to start: {e.code}: {e}", file=sys.stderr)
+        print(f"decideonce-gateway: refusing to start: {e.code}: {e}", file=sys.stderr)
         sys.exit(1)
 
 

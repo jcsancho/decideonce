@@ -12,15 +12,15 @@ import uuid
 
 from . import hostedfit as HF
 from . import labels as L
-from . import probe as P
+from . import stats as S
 from . import render as R
 from . import rules as RU
 from . import schemaval as SV
-from .deciders import DecideRequest, Decider, DeciderError, FakeDecider
-from .deciders import LocalProbeDecider
-from .deciders.hosted import record_hosted_error
+from .store import row_key as _row_key
+from .store import row_seq as _row_seq
+from .deciders import DecideRequest, Decider, DeciderError
+from .deciders.base import record_decider_error
 from .errors import err, ok
-from .jev import FakeJev, JevBackend, JevError
 
 TEACHER_INSTRUCTION = ("Decide yourself among allowed_options, then call "
                        "do_record(decision_id, choice).")
@@ -116,8 +116,27 @@ def _fmt_num(x) -> str:
     return "n/a" if x is None else f"{x:.4f}"
 
 
+def _after_marker(r: dict, mseq: int | None, legacy: tuple | None) -> bool:
+    """Row strictly after a fit/export marker (H2: seq; legacy tuple fallback)."""
+    if legacy is not None:
+        return (r.get("ts") or "", r.get("decision_id") or "") > legacy
+    assert mseq is not None
+    return _row_seq(r) > mseq
+
+
+def _at_or_before_marker(r: dict, mseq: int | None,
+                         legacy: tuple | None) -> bool:
+    """Row at/before a fit marker (H2: seq; legacy tuple fallback)."""
+    if legacy is not None:
+        return (r.get("ts") or "", r.get("decision_id") or "") <= legacy
+    assert mseq is not None
+    return _row_seq(r) <= mseq
+
+
 def _utcnow() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 def _norm_remote_ok(value) -> list[str]:
@@ -166,7 +185,7 @@ def snippet_for(point: dict) -> str:
 
 
 class Service:
-    def __init__(self, cfg: dict, store, jev: JevBackend | dict,
+    def __init__(self, cfg: dict, store, deciders: dict,
                  rng: random.Random | None = None, trainer=None,
                  fireworks_key: str | None = None, monotonic=None,
                  config_path=None):
@@ -185,40 +204,19 @@ class Service:
         from .autopilot import Autopilot  # lazy: autopilot reads service._utcnow
 
         self.autopilot = Autopilot(self)
-        if isinstance(jev, dict):
-            # deciders map (server path, build §2): tiered/hosted behaviour
-            # follows [decider] backend; the raw backend is recovered from
-            # the legacy wrapper for train (local_legacy only).
-            self.deciders: dict[str, Decider] = jev
-            self.jev: JevBackend | None = None
-            for d in jev.values():
-                raw = getattr(d, "jev", None)
-                if raw is not None:
-                    self.jev = raw
-                    break
-            self._legacy_mode = cfg.get("decider", {}).get(
-                "backend", "local_legacy") == "local_legacy"
-        else:
-            # bare backend (tests, gateway direct): always legacy behaviour,
-            # whatever the configured backend (build §2, gates by backend).
-            self.jev = jev
-            if isinstance(jev, FakeJev):
-                wrapped = FakeDecider(jev, store, cfg)
-            else:
-                wrapped = LocalProbeDecider(jev, store, cfg)
-            self.deciders = {"legacy": wrapped}
-            self._legacy_mode = True
+        if not isinstance(deciders, dict):
+            raise TypeError(
+                "Service needs a deciders map from build_deciders; "
+                "a bare backend was removed in M12 P2")
+        self.deciders: dict[str, Decider] = deciders
 
     def _decider_for(self, point: dict) -> Decider | None:
         """The decider for a point, or None when no model is called.
 
-        Legacy mode (local_legacy backend or a bare JevBackend): always the
-        wrapped legacy decider. Tiered: collect/paused call no model (H2);
-        a private point without "hosted_jev" in remote_ok calls nothing,
-        and a private-tier or private-only point never sees hosted Jev (H3).
+        Collect/paused call no model (H2); a private point without
+        "hosted_jev" in remote_ok calls nothing, and a private-tier or
+        private-only point never sees hosted Jev (H3).
         """
-        if self._legacy_mode:
-            return next(iter(self.deciders.values()))
         if point.get("phase", "collect") in ("collect", "paused"):
             return None
         tier = point.get("tier") or ("private" if point.get(
@@ -322,7 +320,7 @@ class Service:
             # state (stop, cooldown, export markers, events, extraction flag).
             for _k in ("autopilot_stopped", "autopilot_demotion_ts",
                        "last_train_export_ts", "last_train_export_id",
-                       "extraction_unreliable"):
+                       "last_train_export_seq", "extraction_unreliable"):
                 if _k in stored:
                     point[_k] = stored[_k]
             if "events" in stored:
@@ -351,7 +349,7 @@ class Service:
                     # demotion; shadow stays.
                     if point["phase"] == "serve":
                         point["phase"] = "shadow"
-                elif (not self._legacy_mode and point["phase"] == "serve"
+                elif (point["phase"] == "serve"
                         and self._hosted_tier(point)):
                     # A6: a bumped point has no fit; without this the point
                     # serves uncalibrated and the fit never refires (fit rows
@@ -694,13 +692,6 @@ class Service:
                       allowed_options=allowed, probabilities={allowed[0]: 1.0},
                       confidence=1.0, threshold=None, instruction=AUTO_INSTRUCTION,
                       warnings=warnings)
-        if self._legacy_mode and point.get("phase") == "paused":
-            base_row.update(state_text=R.render_state(point, context))
-            self._insert(base_row)
-            return ok(decision_id=base_row["decision_id"], mode="teacher", choice=None,
-                      allowed_options=allowed, probabilities=None, confidence=None,
-                      threshold=self._threshold_of(point), instruction=TEACHER_INSTRUCTION,
-                      warnings=warnings)
         state_text = R.render_state(point, context)
         base_row["state_text"] = state_text
         decider = self._decider_for(point)
@@ -716,47 +707,33 @@ class Service:
                                        state_text=state_text)
             res = decider.decide([req])[0]
             base_row["jev_seconds"] = res.seconds
-            if self._legacy_mode:
-                if res._hidden is not None and point.get("phase") in (
-                        "shadow", "serve"):
-                    from . import train as TR
-                    TR.cache_vector(self.store, point, state_text, res._hidden)
-                zs_full = res._zs_full or {}
-                base_row["jev_zero_shot"] = zs_full
-                if res._probe_full is not None:
-                    model = self._current_model(point)
-                    base_row["probe"] = {
-                        "model_version": model["card"].get("model_version"),
-                        "probabilities": res._probe_full}
-                shown_full = res.probs
+            if res.decider == "private":
+                base_row["probe"] = {
+                    "model_version": res.model,
+                    "probabilities": res.probs}
+                self._maybe_store_pending(point, req, base_row)
             else:
-                if res.decider == "private":
-                    base_row["probe"] = {
-                        "model_version": res.model,
-                        "probabilities": res.probs}
-                else:
-                    base_row["hosted"] = {
-                        "model": res.model, "probabilities": res.probs,
-                        "cost_usd": res.cost_usd, "seconds": res.seconds}
-                    self._maybe_store_private(point, req, base_row)
-                base_row["decider"] = res.decider
-                if res.warnings:
-                    warnings = warnings + list(res.warnings)
-                    base_row["warnings"] = warnings or None
-                shown_full = res.probs
-        except (JevError, DeciderError) as e:
+                base_row["hosted"] = {
+                    "model": res.model, "probabilities": res.probs,
+                    "cost_usd": res.cost_usd, "seconds": res.seconds}
+                self._maybe_store_private(point, req, base_row)
+            base_row["decider"] = res.decider
+            if res.warnings:
+                warnings = warnings + list(res.warnings)
+                base_row["warnings"] = warnings or None
+            shown_full = res.probs
+        except DeciderError as e:
             tag = "jev_unavailable"
-            if not self._legacy_mode and isinstance(e, DeciderError):
-                if e.code == "remote_not_allowed":
-                    # blocked before any call: like collect, no warning.
-                    self._insert(base_row)
-                    return ok(decision_id=base_row["decision_id"], mode="teacher",
-                              choice=None, allowed_options=allowed, probabilities={},
-                              confidence=None, threshold=self._threshold_of(point),
-                              instruction=TEACHER_INSTRUCTION, warnings=warnings)
-                record_hosted_error(self.store, point["point_id"], e)
-                tag = {"budget_exceeded": "budget_exceeded",
-                       "no_key": "no_hosted_jev_key"}.get(e.code, tag)
+            if e.code == "remote_not_allowed":
+                # blocked before any call: like collect, no warning.
+                self._insert(base_row)
+                return ok(decision_id=base_row["decision_id"], mode="teacher",
+                          choice=None, allowed_options=allowed, probabilities={},
+                          confidence=None, threshold=self._threshold_of(point),
+                          instruction=TEACHER_INSTRUCTION, warnings=warnings)
+            record_decider_error(self.store, decider, point["point_id"], e)
+            tag = {"budget_exceeded": "budget_exceeded",
+                   "no_key": "no_hosted_jev_key"}.get(e.code, tag)
             base_row["warnings"] = (warnings + [tag]) or None
             self._insert(base_row)
             return ok(decision_id=base_row["decision_id"], mode="teacher", choice=None,
@@ -764,14 +741,14 @@ class Service:
                       threshold=self._threshold_of(point), instruction=TEACHER_INSTRUCTION,
                       warnings=base_row["warnings"] or [])
         probe_used = base_row.get("probe") is not None
-        if (not self._legacy_mode and base_row.get("decider") == "hosted_jev"
+        if (base_row.get("decider") == "hosted_jev"
                 and self._hosted_tier(point)):
             shown = HF.mask_temper(shown_full, allowed,
                                    self._hosted_temperature(point))
         else:
-            shown = P.mask_and_renorm(shown_full, allowed)
+            shown = S.mask_and_renorm(shown_full, allowed)
         confidence = max(shown.values()) if shown else 0.0
-        top = P.argmax(shown, allowed)
+        top = S.argmax(shown, allowed)
         mode, choice, audit = self._select_mode(point, confidence, top, probe_used)
         base_row["mode"] = mode
         base_row["audit"] = audit
@@ -796,38 +773,51 @@ class Service:
             resp["audit"] = True
         return resp
 
-    def _probe_probs(self, model: dict, vector: list[float], point: dict) -> dict | None:
-        try:
-            mp = self.store.models_dir / point["point_id"] / model["path"]
-            params = P.load_model(mp)
-        except Exception:
-            return None
-        try:
-            return P.predict_full(params, vector, list(point["options"]))
-        except Exception:
-            return None
-
-    def _current_model(self, point: dict) -> dict | None:
-        """Active probe trained for the point's current version (stale models never infer)."""
-        model = self.store.active_model(point["point_id"], "probe")
-        if model is None or model.get("point_version") != point.get("point_version", 1):
-            return None
-        return model
-
     def _threshold_of(self, point: dict) -> float | None:
-        if not self._legacy_mode and self._hosted_tier(point):
-            fit = self._hosted_fit(point)
-            return fit.get("threshold") if fit else None
-        model = self._current_model(point)
-        if model is None:
-            return None
-        return model["card"].get("threshold")
+        if not self._hosted_tier(point):
+            model = self.store.active_model(point["point_id"], "private")
+            if model is None or model.get("point_version") != point.get(
+                    "point_version", 1):
+                return None
+            return model.get("card", {}).get("threshold")
+        fit = self._hosted_fit(point)
+        return fit.get("threshold") if fit else None
 
     # -- hosted tier (build §7) --------------------------------------------
     def _hosted_tier(self, point: dict) -> bool:
-        if self._legacy_mode or point.get("private_model_only"):
+        if point.get("private_model_only"):
             return False
         return (point.get("tier") or "hosted_jev") == "hosted_jev"
+
+    def _fit_marker_seq(self, fit: dict, kind: str
+                        ) -> tuple[int | None, tuple | None]:
+        """(seq, legacy) splitting rows at the last fit row (H2).
+
+        New fits carry last_fit_seq. Pre-v14 fits resolve by stored id; when
+        that row is gone (trimmed), the legacy (ts, id) tuple is returned
+        for the old comparison (deterministic on stored data).
+        """
+        s = fit.get("last_fit_seq")
+        if isinstance(s, int):
+            return s, None
+        rid = fit.get("last_fit_decision_id") or ""
+        row = self.store.get_plan(rid) if kind == "plan" \
+            else self.store.get_decision(rid)
+        if row is not None and isinstance(row.get("seq"), int):
+            return row["seq"], None
+        return None, (fit.get("last_fit_ts") or "", rid)
+
+    def _export_marker_seq(self, card: dict
+                           ) -> tuple[int | None, tuple | None]:
+        """(seq, legacy) for a private-model export marker (H2). Same fallback."""
+        s = card.get("export_seq")
+        if isinstance(s, int):
+            return s, None
+        rid = card.get("export_decision_id") or ""
+        row = self.store.get_decision(rid)
+        if row is not None and isinstance(row.get("seq"), int):
+            return row["seq"], None
+        return None, (card.get("export_ts", ""), rid)
 
     def _hosted_fit(self, point: dict, kind: str = "decide") -> dict | None:
         """Active hosted fit for the point's current version, else None."""
@@ -837,6 +827,22 @@ class Service:
             return None
         return fit
 
+    def _private_plan_fit(self, point: dict) -> dict | None:
+        """GP7: active private plan fit for the current version, else None."""
+        fit = self.store.active_hosted_fit(point["point_id"], "plan",
+                                           "private")
+        if fit is None or fit.get("point_version") != point.get(
+                "point_version", 1):
+            return None
+        return fit
+
+    def _plan_fit_for(self, point: dict) -> dict | None:
+        """The plan fit that tempers and gates this point (GP7: private
+        tier reads the private plan fit, never the hosted one)."""
+        if self._effective_tier(point) == "private":
+            return self._private_plan_fit(point)
+        return self._hosted_fit(point, "plan")
+
     def _hosted_temperature(self, point: dict) -> float:
         fit = self._hosted_fit(point)
         return float(fit["temperature"]) if fit else 1.0
@@ -845,7 +851,7 @@ class Service:
         """While a private model is evaluated, its probabilities are stored
         beside hosted Jev's (comparison set C, §6.4 item 8). Best effort: a
         failing private call never breaks the hosted decision."""
-        if self._legacy_mode or not self._hosted_tier(point):
+        if not self._hosted_tier(point):
             return
         model = self.store.active_model(point["point_id"], "private")
         if model is None or model.get("point_version") != point.get(
@@ -856,10 +862,47 @@ class Service:
             return
         try:
             pres = dec.decide([req])[0]
-        except (JevError, DeciderError):
+        except DeciderError:
             return
         base_row["probe"] = {"model_version": pres.model,
                              "probabilities": pres.probs}
+
+    def _pending_private_model(self, point: dict) -> dict | None:
+        """F9 (§7.2 step 5): the pending checkpoint, or None when absent,
+        active (raced the switch) or version-stale."""
+        marker = point.get("pending_private_model") or {}
+        mid = marker.get("model_id")
+        if not isinstance(mid, int):
+            return None
+        model = self.store.get_model(mid)
+        if model is None or model.get("active"):
+            return None
+        if model.get("point_version") != point.get("point_version", 1):
+            return None
+        return model
+
+    def _maybe_store_pending(self, point: dict, req, base_row: dict) -> None:
+        """While a retrained checkpoint is pending, its probabilities are
+        logged beside the serving one's (switch evidence, §7.2 step 5).
+        Best effort, like _maybe_store_private."""
+        if point.get("phase") != "serve":
+            return
+        model = self._pending_private_model(point)
+        if model is None:
+            return
+        dec = self.deciders.get("private")
+        if dec is None or not hasattr(dec, "decide_as"):
+            return
+        card = model.get("card", {})
+        if not card.get("model_ref"):
+            return
+        try:
+            pres = dec.decide_as(card["model_ref"],
+                                 card.get("temperature", 1.0), [req])[0]
+        except DeciderError:
+            return
+        base_row["pending_probe"] = {"model_version": pres.model,
+                                     "probabilities": pres.probs}
 
     @staticmethod
     def _tier_label(row: dict, point: dict) -> str | None:
@@ -897,8 +940,7 @@ class Service:
             if label is None:
                 continue
             out.append((r, label))
-        out.sort(key=lambda t: (t[0].get("ts") or "",
-                                t[0].get("decision_id") or ""))
+        out.sort(key=lambda t: _row_key(t[0]))
         return out
 
     def _fit_candidates(self, point: dict) -> list[tuple[dict, str]]:
@@ -906,8 +948,7 @@ class Service:
         epoch = point.get("fit_epoch_start", "")
         return [(r, lab) for r, lab in self._tier_rows(point)
                 if r.get("phase") == "shadow"
-                and (r.get("ts") or "", r.get("decision_id") or "")
-                >= (epoch, "")]
+                and (r.get("ts") or "") >= epoch]
 
     def _evidence_rows(self, point: dict, fit: dict,
                        since: tuple | None = None
@@ -915,29 +956,26 @@ class Service:
         """Labelled rows after the last fit row: shadow rows plus audited
         serve rows (unaudited auto rows have no independent label). since
         (M16) further keeps rows decided after a demotion only."""
-        marker = (fit["last_fit_ts"], fit["last_fit_decision_id"])
+        mseq, legacy = self._fit_marker_seq(fit, "decide")
         return [(r, lab) for r, lab in self._tier_rows(point)
                 if (r.get("phase") == "shadow"
                     or (r.get("phase") == "serve" and r.get("audit")))
-                and (r.get("ts") or "", r.get("decision_id") or "")
-                > marker
-                and (since is None or (r.get("ts") or "",
-                                       r.get("decision_id") or "") > since)]
+                and _after_marker(r, mseq, legacy)
+                and (since is None or (r.get("ts") or "") >= since[0])]
 
     def _late_rows(self, point: dict, fit: dict) -> list[tuple[dict, str]]:
         """Labelled rows decided at/before the last fit row that are not fit
         rows: decided before, labelled after (build §7, G2). Current epoch
         only: after a drift + refit, previous-epoch rows would otherwise all
         count as late (D)."""
-        marker = (fit["last_fit_ts"], fit["last_fit_decision_id"])
+        mseq, legacy = self._fit_marker_seq(fit, "decide")
         epoch = point.get("fit_epoch_start", "")
         ids = set(fit.get("fit_ids") or [])
         return [(r, lab) for r, lab in self._tier_rows(point)
                 if (r.get("phase") == "shadow"
                     or (r.get("phase") == "serve" and r.get("audit")))
-                and (epoch, "") <= (r.get("ts") or "",
-                                    r.get("decision_id") or "")
-                <= marker
+                and (r.get("ts") or "") >= epoch
+                and _at_or_before_marker(r, mseq, legacy)
                 and (r.get("decision_id") or "") not in ids]
 
     def _shadow_label_coverage(self, point: dict,
@@ -962,46 +1000,12 @@ class Service:
                 continue
             if r.get("point_version") != ver:
                 continue
-            if (r.get("ts") or "", r.get("decision_id") or "") < (epoch, ""):
+            if (r.get("ts") or "") < epoch:
                 continue
-            if since is not None and (r.get("ts") or "",
-                                      r.get("decision_id") or "") <= since:
+            if since is not None and (r.get("ts") or "") < since[0]:
                 continue
             decided += 1
             if self._tier_label(r, point) is not None:
-                labelled += 1
-        return labelled, decided
-
-    def _shadow_label_coverage_legacy(self, point: dict,
-                                      since: tuple | None = None
-                                      ) -> tuple[int, int]:
-        """E6: legacy labelled ratio (teacher/outcome labels, no hosted rows).
-
-        Mirrors _shadow_label_coverage for the probe path so selective
-        labelling cannot promote automatically.
-        """
-        ver = point.get("point_version", 1)
-        epoch = point.get("fit_epoch_start", "")
-        options = set(point["options"])
-        decided = labelled = 0
-        for r in self.store.decisions_for_point(point["point_id"]):
-            if r.get("phase") != "shadow":
-                continue
-            if r.get("source") not in LIVE_SOURCES:
-                continue
-            if r.get("mode") == "rule":
-                continue
-            if r.get("point_version") != ver:
-                continue
-            if (r.get("ts") or "", r.get("decision_id") or "") < (epoch, ""):
-                continue
-            if since is not None and (r.get("ts") or "",
-                                      r.get("decision_id") or "") <= since:
-                continue
-            decided += 1
-            label, source, _ = L.resolve_label(r)
-            if label is not None and source in ("teacher", "outcome_correct",
-                                                "outcome_ok") and label in options:
                 labelled += 1
         return labelled, decided
 
@@ -1015,7 +1019,7 @@ class Service:
         for r, label in pairs:
             allowed = r.get("allowed_options") or options
             tm = HF.mask_temper(r["hosted"]["probabilities"], allowed, T)
-            top = P.argmax(tm, allowed)
+            top = S.argmax(tm, allowed)
             bad_followed = L.resolve_label(r)[1] == "outcome_bad_no_fix"
             out.append((max(tm.values()) if tm else 0.0,
                         False if bad_followed else top == label))
@@ -1025,8 +1029,6 @@ class Service:
                           kind: str = "decide") -> dict | None:
         """One-time fit at fit_rows labelled rows (build §7). Returns the fit
         (new or existing) or None."""
-        if self._legacy_mode:
-            return None
         if kind == "plan":
             return self._maybe_fit_plan(point_id)
         point = self.store.get_point(point_id)
@@ -1050,12 +1052,12 @@ class Service:
         bad = []
         for r, label in chosen:
             allowed = r.get("allowed_options") or options
-            items.append((P.mask_and_renorm(r["hosted"]["probabilities"],
+            items.append((S.mask_and_renorm(r["hosted"]["probabilities"],
                                             allowed), allowed, label, r))
             bad.append(L.resolve_label(r)[1] == "outcome_bad_no_fix")
         clean = [(m, a, l) for (m, a, l, _r), b in zip(items, bad) if not b]
         n_bad = sum(1 for b in bad if b)
-        n_clean_err = sum(1 for m, a, l in clean if P.argmax(m, a) != l)
+        n_clean_err = sum(1 for m, a, l in clean if S.argmax(m, a) != l)
         if n_bad + n_clean_err < 5 or not clean:
             T, skipped = 1.0, "too_few_errors"
         else:
@@ -1064,7 +1066,7 @@ class Service:
         tops: list[str] = []
         for (masked, allowed, label, _r), is_bad in zip(items, bad):
             tm = HF.temper_full(masked, T)
-            top = P.argmax(tm, allowed)
+            top = S.argmax(tm, allowed)
             tops.append(top)
             scored.append((max(tm.values()) if tm else 0.0,
                           False if is_bad else top == label))
@@ -1101,6 +1103,7 @@ class Service:
             "fitted_at": _utcnow(), "n_fit": len(chosen),
             "last_fit_ts": last.get("ts") or "",
             "last_fit_decision_id": last.get("decision_id") or "",
+            "last_fit_seq": last.get("seq"),
             "temperature": T, "temperature_skipped": skipped,
             "threshold": threshold, "coverage": coverage,
             "error_at_threshold": err_at,
@@ -1125,12 +1128,16 @@ class Service:
         # not the decide epoch). Without this a demoted point refits on the
         # pre-demotion comparisons that caused the demotion.
         epoch = Service._plan_epoch(point)
+        eval_ids = self.store.eval_only_transcript_ids(point["workflow"])
         out = []
         for plan in self.store.plans_for_workflow(point["workflow"]):
-            if (plan["ts"], plan["plan_id"]) < (epoch, ""):
+            if plan["ts"] < epoch:
                 continue
             if plan.get("pilot_forced"):
                 continue
+            t = self.store.transcript_for_plan(plan["plan_id"])
+            if t is not None and (t.get("transcript_id") or "") in eval_ids:
+                continue  # P2 parity: eval-only runs never fit or count
             if plan.get("trial_id") or plan.get("pair_id"):
                 continue
             is_audit = bool(plan.get("audit"))
@@ -1154,15 +1161,23 @@ class Service:
                     if not gate["passed"]:
                         continue
                 out.append({"plan_id": plan["plan_id"], "ts": plan["ts"],
-                            **c})
-        out.sort(key=lambda c: (c["ts"], c["plan_id"]))
+                            "seq": plan.get("seq"), **c})
+        out.sort(key=lambda c: (_row_seq(c), c["ts"], c["plan_id"]))
         return out
 
     def _plan_evidence_hosted(self, point: dict, fit: dict) -> list[dict]:
         """Hosted plan evidence: comparisons after the last fit comparison."""
-        marker = (fit["last_fit_ts"], fit["last_fit_decision_id"])
-        return [c for c in self._hosted_plan_comparisons(point)
-                if (c["ts"], c["plan_id"]) > marker]
+        mseq, legacy = self._fit_marker_seq(fit, "plan")
+        out = []
+        for c in self._hosted_plan_comparisons(point):
+            if legacy is not None:
+                after = (c["ts"], c["plan_id"]) > legacy
+            else:
+                assert mseq is not None
+                after = _row_seq(c) > mseq
+            if after:
+                out.append(c)
+        return out
 
     def _score_plan_hosted(self, point: dict, comps: list[dict],
                            T: float) -> list[tuple[float, bool]]:
@@ -1172,7 +1187,7 @@ class Service:
         for c in comps:
             allowed = c.get("allowed_options") or options
             tm = HF.mask_temper(c["probabilities"], allowed, T)
-            top = P.argmax(tm, allowed)
+            top = S.argmax(tm, allowed)
             out.append((max(tm.values()) if tm else 0.0, top == c["label"]))
         return out
 
@@ -1186,7 +1201,33 @@ class Service:
             if fit.get("point_version") == point.get("point_version", 1):
                 return fit
             self.store.deactivate_hosted_fit(point_id, "plan")
-        comps = self._hosted_plan_comparisons(point)
+        return self._fit_plan_core(
+            point, self._hosted_plan_comparisons(point), "hosted_jev")
+
+    def _private_plan_comparisons(self, point: dict) -> list[dict]:
+        """GP7: plan comparisons predicted by the private tier (at-start
+        contexts, like all plan predictions)."""
+        return [c for c in self._hosted_plan_comparisons(point)
+                if c.get("decider") == "private"]
+
+    def _maybe_fit_private_plan(self, point_id: str) -> dict | None:
+        """GP7: one-time private plan fit, the same procedure as the
+        hosted plan fit, over private-tier comparisons."""
+        point = self.store.get_point(point_id)
+        if point is None or self._effective_tier(point) != "private":
+            return None
+        fit = self.store.active_hosted_fit(point_id, "plan", "private")
+        if fit is not None:
+            if fit.get("point_version") == point.get("point_version", 1):
+                return fit
+            self.store.deactivate_hosted_fit(point_id, "plan", "private")
+        return self._fit_plan_core(
+            point, self._private_plan_comparisons(point), "private")
+
+    def _fit_plan_core(self, point: dict, comps: list[dict],
+                       tier: str) -> dict | None:
+        """Shared plan-fit procedure (hosted + GP7 private): T, §6.1
+        threshold, per-option recall/precision, one stored fit row."""
         need = int(self.cfg["hosted_jev"]["fit_rows"])
         if len(comps) < need:
             return None
@@ -1195,13 +1236,13 @@ class Service:
         items = []
         for c in chosen:
             allowed = c.get("allowed_options") or options
-            items.append((P.mask_and_renorm(c["probabilities"], allowed),
+            items.append((S.mask_and_renorm(c["probabilities"], allowed),
                           allowed, c["label"]))
         T, skipped = HF.fit_temperature(items)
         scored, tops = [], []
         for masked, allowed, label in items:
             tm = HF.temper_full(masked, T)
-            top = P.argmax(tm, allowed)
+            top = S.argmax(tm, allowed)
             tops.append(top)
             scored.append((max(tm.values()) if tm else 0.0, top == label))
         threshold = HF.fit_threshold(scored, self.cfg["plan"]["target_error"],
@@ -1235,11 +1276,13 @@ class Service:
         # A4: same race as the decide fit; the re-check and the insert are
         # one BEGIN IMMEDIATE.
         return self.store.save_hosted_fit_once({
-            "point_id": point_id,
+            "point_id": point.get("point_id"),
             "point_version": point.get("point_version", 1), "kind": "plan",
+            "tier": tier,
             "epoch_start_ts": Service._plan_epoch(point),
             "fitted_at": _utcnow(), "n_fit": len(chosen),
             "last_fit_ts": last["ts"], "last_fit_decision_id": last["plan_id"],
+            "last_fit_seq": last.get("seq"),
             "temperature": T, "temperature_skipped": skipped,
             "threshold": threshold, "coverage": coverage,
             "error_at_threshold": err_at,
@@ -1263,21 +1306,181 @@ class Service:
         the private export, in shadow (or audited serve), with both models'
         probabilities stored, and no hosted fit row. since (M16) further
         keeps rows decided after a demotion only."""
-        marker = (card.get("export_ts", ""),
-                  card.get("export_decision_id", ""))
+        mseq, legacy = self._export_marker_seq(card)
         fit = self._hosted_fit(point)
         fit_ids = set(fit.get("fit_ids") or []) if fit else set()
         return [(r, lab) for r, lab in self._tier_rows(point)
                 if r.get("probe")
                 and (r.get("phase") == "shadow"
                      or (r.get("phase") == "serve" and r.get("audit")))
-                and (r.get("ts") or "", r.get("decision_id") or "") > marker
-                and (since is None or (r.get("ts") or "",
-                                       r.get("decision_id") or "") > since)
+                and _after_marker(r, mseq, legacy)
+                and (since is None or (r.get("ts") or "") >= since[0])
                 and (r.get("decision_id") or "") not in fit_ids
                 # A3: on a followed row the outcome marked wrong the true
                 # label is unknown, so neither model can be scored on it.
                 and L.resolve_label(r)[1] != "outcome_bad_no_fix"]
+
+    def _pending_rows(self, point: dict, card: dict,
+                      ) -> list[tuple[dict, str]]:
+        """F9 (§7.2 step 5): labelled rows with this pending checkpoint's
+        probabilities stored, in shadow (or audited serve), decided after
+        its export. Mirrors _comparison_rows (same unbiased rule)."""
+        mseq, legacy = self._export_marker_seq(card)
+        ver = point.get("point_version", 1)
+        ref = card.get("model_ref")
+        out = []
+        for r in self.store.decisions_for_point(point["point_id"]):
+            pp = r.get("pending_probe") or {}
+            if not pp.get("probabilities") or pp.get("model_version") != ref:
+                continue
+            if r.get("source") not in LIVE_SOURCES:
+                continue
+            if r.get("point_version") != ver:
+                continue
+            if not (r.get("phase") == "shadow"
+                    or (r.get("phase") == "serve" and r.get("audit"))):
+                continue
+            if not _after_marker(r, mseq, legacy):
+                continue
+            if L.resolve_label(r)[1] == "outcome_bad_no_fix":
+                continue
+            label = self._tier_label(r, point)
+            if label is None:
+                continue
+            out.append((r, label))
+        out.sort(key=lambda t: _row_key(t[0]))
+        return out
+
+    def _pending_switch_checks(self, point: dict, pending: dict,
+                               confirm: bool) -> dict:
+        """F9 (§7.2 step 5): §6.4 for the pending checkpoint. Items 1-7
+        over its held-out card metrics plus pending rows; item 8 adapts
+        to old-vs-new (no hosted arm serves private-tier traffic): the
+        paired McNemar must not favor the old checkpoint, the new pool
+        error must meet the target, and coverage must not collapse."""
+        from . import stats as S
+        tc, sc = self.cfg["train"], self.cfg["serve"]
+        target = point.get("target_error", sc["target_error"])
+        card = pending.get("card", {})
+        metrics = card.get("metrics", {})
+        tp = card.get("threshold")
+        options = list(point["options"])
+        n_h = int(metrics.get("n_holdout") or 0)
+        cov_h = metrics.get("coverage")
+        err_h = metrics.get("error_at_threshold")
+        n_at_h = int(round((cov_h or 0.0) * n_h)) if n_h else 0
+        e_at_h = int(round((err_h or 0.0) * n_at_h)) if n_at_h else 0
+        rows = self._pending_rows(point, card)
+        scored, olds = [], []
+        for r, label in rows:
+            allowed = r.get("allowed_options") or options
+            pm = S.mask_and_renorm(
+                (r.get("pending_probe") or {}).get("probabilities") or {},
+                allowed)
+            om = S.mask_and_renorm(
+                (r.get("probe") or {}).get("probabilities") or {}, allowed)
+            scored.append((max(pm.values()) if pm else 0.0,
+                           S.argmax(pm, allowed) == label if pm else False))
+            olds.append((max(om.values()) if om else 0.0,
+                         S.argmax(om, allowed) == label if om else False))
+        checks: dict[str, dict] = {}
+        n_labelled = len(L.labeled_rows(
+            self.store.decisions_for_point(point["point_id"]), point,
+            self.cfg["train"]["teacher_only_weight"],
+            self.cfg["extract"]["weight"]))
+        checks["min_examples"] = {
+            "pass": n_labelled >= tc["min_examples"],
+            "detail": f"{n_labelled} labelled rows, need "
+                      f"{tc['min_examples']}"}
+        checks["threshold"] = {
+            "pass": tp is not None,
+            "detail": f"pending threshold={tp}"}
+        coverage = metrics.get("coverage")
+        checks["coverage"] = {
+            "pass": tp is not None and coverage is not None
+            and coverage >= sc["min_coverage"],
+            "detail": f"held-out coverage={coverage}, need "
+                      f"{sc['min_coverage']}"}
+        pool = [(c, ok) for c, ok in scored if tp is not None and c >= tp]
+        n_pool = n_at_h + len(pool)
+        e_pool = e_at_h + sum(1 for _, ok in pool if not ok)
+        upper = S.wilson_upper(e_pool, n_pool) if n_pool else 1.0
+        checks["evidence"] = {
+            "pass": n_pool > 0 and upper <= target,
+            "detail": f"pool n={n_pool} (held-out {n_at_h} + pending "
+                      f"{len(pool)}), errors={e_pool}, Wilson upper="
+                      f"{upper:.4f}, target={target}"}
+        pool_err = (e_pool / n_pool) if n_pool else 1.0
+        acc_h = metrics.get("accuracy")
+        agree_p = (sum(1 for _, ok in scored if ok) / len(scored)
+                   if scored else None)
+        if acc_h is not None and n_h and agree_p is not None and scored:
+            baseline = 1.0 - (acc_h * n_h + agree_p * len(scored)) / (
+                n_h + len(scored))
+        elif acc_h is not None:
+            baseline = 1.0 - acc_h
+        else:
+            baseline = 1.0
+        checks["margin"] = self._margin_check(
+            n_pool, pool_err, baseline, target, sc["min_margin_vs_random"],
+            "combined baseline")
+        checks["shadow"] = {
+            "pass": len(rows) >= sc["min_shadow"],
+            "detail": f"{len(rows)} pending rows, need {sc['min_shadow']}"}
+        checks["shadow_agreement"] = {
+            "pass": agree_p is not None and acc_h is not None
+            and len(rows) >= sc["min_shadow"]
+            and abs(agree_p - acc_h) <= 0.05,
+            "detail": f"pending agreement {agree_p} vs held-out {acc_h} "
+                      "(need within 0.05)"}
+        both, disagree = L.teacher_disagreement(
+            self.store.decisions_for_point(point["point_id"]))
+        unreliable = both > 0 and disagree / both > tc["teacher_alarm"]
+        checks["teacher"] = {
+            "pass": not unreliable,
+            "detail": f"outcome/teacher disagreements {disagree}/{both} "
+                      f"(alarm above {tc['teacher_alarm']})"}
+        checks["confirm"] = {
+            "pass": bool(confirm),
+            "detail": ("the user agreed" if confirm
+                       else "confirm: true required")}
+        if point.get("source") == "gateway":
+            from . import gateway as GW
+            fe = GW.format_evidence(self.cfg, self.store, point)
+            gcfg = self.cfg["gateway"]
+            n_ok = fe["n_compared"] >= gcfg["format_min_n"]
+            wl = fe["wilson_lower"]
+            w_ok = wl is not None and wl >= gcfg["format_match_min"]
+            ur = fe["unparsed_rate"]
+            u_ok = ur is not None and ur <= gcfg["max_unparsed"]
+            checks["gateway_format"] = {
+                "pass": n_ok and w_ok and u_ok,
+                "detail": (f"compared={fe['n_compared']}/"
+                           f"{gcfg['format_min_n']}, unparsed "
+                           f"{fe['n_unparsed']}/{fe['n_answered']}")}
+        old = self.store.active_model(point["point_id"], "private")
+        if old is None:
+            checks["private_item8"] = {
+                "pass": True,
+                "detail": "no serving checkpoint to regress from"}
+            return checks
+        b = sum(1 for (_, oo), (_, ok) in zip(olds, scored) if oo and not ok)
+        c = sum(1 for (_, oo), (_, ok) in zip(olds, scored) if ok and not oo)
+        cov_o = (sum(1 for co, _ in olds if tp is not None and co >= tp)
+                 / len(olds)) if olds else 0.0
+        cov_n = (len(pool) / len(scored)) if scored else 0.0
+        gain = self.cfg["hosted_jev"]["min_private_gain"]
+        mcnemar = b <= c
+        err_ok = (e_pool / n_pool) <= target if n_pool else False
+        cov_ok = cov_n >= cov_o - gain
+        checks["private_item8"] = {
+            "pass": bool(scored and mcnemar and err_ok and cov_ok),
+            "detail": (f"pending n={len(scored)}, new err="
+                       f"{(e_pool / n_pool) if n_pool else None}, "
+                       f"new cov={cov_n:.3f} vs old cov={cov_o:.3f}, "
+                       f"discordant old-only/new-only {b}/{c}, McNemar p="
+                       f"{_mcnemar_p(b, c):.4f}")}
+        return checks
 
     def _private_comparison(self, point: dict,
                             since: tuple | None = None) -> dict | None:
@@ -1298,12 +1501,12 @@ class Service:
         for r, label in rows:
             allowed = r.get("allowed_options") or options
             tm = HF.mask_temper(r["hosted"]["probabilities"], allowed, T)
-            pm = P.mask_and_renorm(
+            pm = S.mask_and_renorm(
                 (r.get("probe") or {}).get("probabilities") or {}, allowed)
             hs.append((max(tm.values()) if tm else 0.0,
-                       P.argmax(tm, allowed) == label if tm else False))
+                       S.argmax(tm, allowed) == label if tm else False))
             ps.append((max(pm.values()) if pm else 0.0,
-                       P.argmax(pm, allowed) == label if pm else False))
+                       S.argmax(pm, allowed) == label if pm else False))
 
         def pool_stats(scored, t):
             if t is None:
@@ -1369,10 +1572,11 @@ class Service:
                     or e.get("tier") != "hosted_jev":
                 continue
             try:
-                import calendar
-                ts = calendar.timegm(time.strptime(
-                    e.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ"))
-            except (ValueError, TypeError):
+                from datetime import datetime
+                raw = e.get("ts", "")
+                ts = datetime.fromisoformat(
+                    raw.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError, AttributeError):
                 continue
             if now - ts <= window_s:
                 recent += 1
@@ -1451,14 +1655,18 @@ class Service:
                 "fitted": False,
                 "comparisons": len(self._hosted_plan_comparisons(point)),
                 "fit_rows": int(self.cfg["hosted_jev"]["fit_rows"])}
+        fake = self.cfg.get("decider", {}).get("backend") == "fake"
         return {
             "calls_month": spend["calls"],
             "spend_month_usd": spend["usd"], "budget_usd": budget,
             "budget_warning_80": bool(budget and spend["usd"] >= 0.8 * budget),
             "open_reservations_usd": open_r["usd"],
             "open_reservations_n": open_r["n"],
-            "spend_note": "settled cost is an estimate from usage; "
-                          "compare with the OpenRouter bill",
+            "spend_simulated": fake,
+            "spend_note": ("simulated spend: the fake backend bills "
+                           "nothing" if fake else
+                           "settled cost is an estimate from usage; "
+                           "compare with the OpenRouter bill"),
             "median_latency_s": (statistics.median(lats) if lats else None),
             "errors": {
                 "timeout": self.store.counter_get("hosted_error_timeout",
@@ -1503,16 +1711,23 @@ class Service:
         """Mode selection (§6.2). Returns (mode, choice, audit)."""
         if point.get("phase") != "serve":
             return "teacher", None, False
-        if not self._legacy_mode:
-            return self._select_mode_hosted(point, confidence, top)
-        if not probe_used:
-            return "teacher", None, False
-        model = self._current_model(point)
-        card = model["card"] if model else {}
+        return self._select_mode_hosted(point, confidence, top)
+
+    def _select_mode_private(self, point: dict, confidence: float,
+                               top: str) -> tuple[str, str | None, bool]:
+        """Mode selection on the private tier (F9, §6.2): the active card's
+        threshold and teacher-only options, then the same audit sample as
+        hosted. Without a card for this version, teacher with no audit."""
+        model = self.store.active_model(point["point_id"], "private")
+        card = {}
+        if model is not None and model.get("point_version") == point.get(
+                "point_version", 1):
+            card = model.get("card", {})
         threshold = card.get("threshold")
         if threshold is None or confidence < threshold:
             return "teacher", None, False
-        if top in (card.get("teacher_only_options") or []):
+        if top in ((card.get("metrics") or {}).get("teacher_only_options")
+                   or []):
             return "teacher", None, False
         if point.get("irreversible") and not self.cfg["serve"]["allow_auto_irreversible"]:
             return "teacher", None, False
@@ -1525,7 +1740,7 @@ class Service:
         """Mode selection on the hosted tier: fit threshold, teacher-only
         options and the tempered masked confidence (§6.2 rest unchanged)."""
         if not self._hosted_tier(point):
-            return "teacher", None, False  # private tier serves in M11
+            return self._select_mode_private(point, confidence, top)
         fit = self._hosted_fit(point)
         threshold = fit.get("threshold") if fit else None
         if threshold is None or confidence < threshold:
@@ -1544,7 +1759,7 @@ class Service:
         if not probs:
             return None
         allowed = row.get("allowed_options") or list(probs)
-        return P.argmax(P.mask_and_renorm(probs, allowed), allowed)
+        return S.argmax(S.mask_and_renorm(probs, allowed), allowed)
 
     def _drift_check(self, point_id: str) -> bool:
         """Demote serve -> shadow on audit evidence (§6.2). Returns True when demoted."""
@@ -1552,8 +1767,9 @@ class Service:
         point = self.store.get_point(point_id)
         if point is None or point.get("phase") != "serve":
             return False
-        if not self._legacy_mode and self._hosted_tier(point):
+        if self._hosted_tier(point):
             return self._drift_check_hosted(point)
+        # Private tier: drift on the stored private probabilities.
         target = point.get("target_error", self.cfg["serve"]["target_error"])
         window = self.cfg["serve"]["drift_window"]
         audits = [r for r in self.store.decisions_for_point(point_id)
@@ -1593,8 +1809,7 @@ class Service:
                   if r.get("audit") and r.get("teacher_choice")
                   and r.get("source") in LIVE_SOURCES and r.get("hosted")
                   and r.get("point_version") == ver
-                  and (r.get("ts") or "", r.get("decision_id") or "")
-                  >= (epoch, "")]
+                  and (r.get("ts") or "") >= epoch]
         last = audits[-window:]
         if len(last) < window:
             return False
@@ -1603,7 +1818,7 @@ class Service:
         for r in last:
             allowed = r.get("allowed_options") or options
             tm = HF.mask_temper(r["hosted"]["probabilities"], allowed, T)
-            if P.argmax(tm, allowed) != r["teacher_choice"]:
+            if S.argmax(tm, allowed) != r["teacher_choice"]:
                 errs += 1
         if errs / n > 2 * target and S.wilson_lower(errs, n) > target:
             point["phase"] = "shadow"
@@ -1640,14 +1855,13 @@ class Service:
         override = False
         if row.get("mode") == "auto":
             hosted = (row.get("hosted") or {}).get("probabilities") or {}
-            if not self._legacy_mode and hosted:
+            if hosted:
                 # D: a hosted-serve auto choice came from the hosted
-                # tempered top, not the probe/zero-shot the legacy path
-                # compares against (tempering never moves the argmax).
+                # tempered top (tempering never moves the argmax).
                 returned = L.hosted_top(row)
             else:
                 shown = (row.get("probe") or {}).get("probabilities") or row.get("jev_zero_shot") or {}
-                returned = P.argmax(shown, row.get("allowed_options") or [])
+                returned = S.argmax(shown, row.get("allowed_options") or [])
             override = choice != returned
         # R2-7: the already_recorded check and the write are one
         # BEGIN IMMEDIATE (MCP server and gateway are separate processes).
@@ -1713,7 +1927,7 @@ class Service:
                     or args.get("extractor_local")):
                 return err("private_needs_confirm",
                            "private transcript: confirm the extractor child runs "
-                           "with Contributor mode off "
+                           "with (Muse) Contributor mode off "
                            "(contributor_off_confirmed: true) or extracts "
                            "locally (extractor_local: true)")
             points = self._extract_points(stored["workflow"])
@@ -1760,7 +1974,8 @@ class Service:
                 args.get("contributor_off_confirmed") or args.get("extractor_local")):
             return err("private_needs_confirm",
                        "private transcript: confirm the extractor child runs with "
-                       "Contributor mode off (contributor_off_confirmed: true) or "
+                       "(Muse) Contributor mode off "
+                       "(contributor_off_confirmed: true) or "
                        "extracts locally (extractor_local: true)")
         if self.store.transcript_by_run(transcript["run_id"]) is not None:
             return err("duplicate_run",
@@ -1803,7 +2018,7 @@ class Service:
                 or args.get("extractor_local")):
             return err("private_needs_confirm",
                        "private transcript: confirm the pass-2 extractor child "
-                       "runs with Contributor mode off "
+                       "runs with (Muse) Contributor mode off "
                        "(contributor_off_confirmed: true) or extracts "
                        "locally (extractor_local: true)")
         p1 = [e for e in self.store.extractions_for_transcript(
@@ -2145,6 +2360,7 @@ class Service:
             for pid in {a.get("point_id") for a in accepted
                         if a.get("point_id")}:
                 self._maybe_fit_hosted(pid, "plan")
+                self._maybe_fit_private_plan(pid)
         scored = [AN.score_candidate(np, self.cfg) for np in new_points]
         out = ok(extraction_id=ex["extraction_id"],
                  transcript_id=t["transcript_id"],
@@ -2204,72 +2420,22 @@ class Service:
 
     def _jev_disagreements(self, ex: dict, detail: list[dict]
                            ) -> tuple[list[dict], list[str]]:
-        """Mode C audit (§15.2): pass-1 records where the point's probe top
-        differs from the extracted choice at or above the point threshold.
-        Read-only; never changes state."""
-        disagreements: list[dict] = []
-        jev_errors: list[str] = []
-        if ex["pass"] != 1:
-            return disagreements, jev_errors
-        if self.jev is None:
-            return disagreements, jev_errors  # tiered: no raw backend
-        for d in detail:
-            if d is None:
-                continue
-            point = d["point"]
-            model = self._current_model(point)
-            if model is None:
-                continue
-            threshold = model["card"].get("threshold")
-            if threshold is None:
-                continue
-            try:
-                vector, _, _ = self.jev.hidden(
-                    point["kind"], d["state_text"], point["question"],
-                    list(point["options"]))
-            except JevError:
-                jev_errors.append(point["point_id"])
-                continue
-            probe_full = self._probe_probs(model, vector, point)
-            if probe_full is None:
-                continue
-            masked = P.mask_and_renorm(probe_full, d["allowed"])
-            if not masked:
-                continue
-            top = P.argmax(masked, d["allowed"])
-            conf = max(masked.values())
-            if top != d["choice"] and conf >= threshold:
-                disagreements.append({
-                    "decision_id": d["decision_id"],
-                    "point_id": point["point_id"],
-                    "extracted_choice": d["choice"], "probe_choice": top,
-                    "confidence": conf, "threshold": threshold})
-        return disagreements, jev_errors
+        """Mode C audit (§15.2): M12 P3 deleted the probe, so there is no
+        probe top to compare against; extract completes with no
+        disagreements. Read-only; never changes state."""
+        return [], []
 
     # -- do_train --------------------------------------------------------
     def do_train(self, args: dict) -> dict:
-        from . import train as TR
-        from .errors import ToolError
         errors = SV.validate("do_train", args) if isinstance(args, dict) else ["<root>: not an object"]
         if errors:
             return err("invalid_args", "; ".join(errors[:3]))
-        if not self._legacy_mode:
-            return self._dm_train_tiered(args)
-        try:
-            body = TR.train_point(self.cfg, self.store, self.jev,
-                                  args["point_id"], bool(args.get("dry_run", False)))
-        except ToolError as e:
-            out = err(e.code, str(e))
-            out.update(e.extra)
-            return out
-        return ok(**body)
+        return self._dm_train_tiered(args)
 
     def _dm_train_tiered(self, args: dict) -> dict:
         """v1.7 precondition (H5, G6): a hosted-tier point trains only when
         train_recommended, private_model_only or force; until M11 the private
         tier itself is not built, so allowed calls report what would train."""
-        from . import train as TR
-        from .errors import ToolError
         point = self.store.get_point(args["point_id"])
         if point is None:
             return err("unknown_point",
@@ -2285,25 +2451,29 @@ class Service:
                            hosted=self._hosted_metrics(point))
         if self.trainer is not None:
             return self._dm_train_job(args, point)
-        if self.jev is not None:
-            try:
-                summary = TR.train_point(self.cfg, self.store, self.jev,
-                                         args["point_id"], True)
-            except ToolError as e:
-                summary = {"not_enough_data": str(e)}
-        else:
-            labeled = L.labeled_rows(
-                self.store.decisions_for_point(args["point_id"]), point,
-                self.cfg["train"]["teacher_only_weight"],
-                self.cfg["extract"]["weight"])
-            by_opt: dict[str, int] = {}
-            for _, lab, _, _ in labeled:
-                by_opt[lab] = by_opt.get(lab, 0) + 1
-            summary = {"n_labeled": len(labeled), "per_option": by_opt,
-                       "dry_run": True}
-        return err("private_tier_not_built",
-                   "the private tier needs M11 (Fireworks training); "
-                   "nothing was trained",
+        # F9: no trainer was built; say exactly why (key or cookbook pin).
+        from .trainer import live_trainer_unavailable_reason
+
+        labeled = L.labeled_rows(
+            self.store.decisions_for_point(args["point_id"]), point,
+            self.cfg["train"]["teacher_only_weight"],
+            self.cfg["extract"]["weight"])
+        by_opt: dict[str, int] = {}
+        for _, lab, _, _ in labeled:
+            by_opt[lab] = by_opt.get(lab, 0) + 1
+        summary = {"n_labeled": len(labeled), "per_option": by_opt,
+                   "dry_run": True}
+        reason = live_trainer_unavailable_reason(
+            self.cfg, self.store, self.fireworks_key) or "no_fireworks_key"
+        detail = {"no_fireworks_key": "set fireworks.key_ref to train",
+                  "cookbook_missing": "fireworks.cookbook_dir is not a "
+                                      "cookbook checkout",
+                  "cookbook_mismatch": "cookbook checkout is not at "
+                                       "fireworks.cookbook_commit"}[reason]
+        # F9: private_tier_not_built is removed; do_train names the
+        # reason (no_fireworks_key / cookbook_missing / cookbook_mismatch).
+        return err(reason, f"private-tier training is unavailable: {detail}; "
+                           "nothing was trained",
                    export=summary)
 
     def _dm_train_job(self, args: dict, point: dict) -> dict:
@@ -2314,21 +2484,36 @@ class Service:
         if finals:
             fin = finals[-1]
             job = self.store.job_get(fin.get("job_id", ""))
-            return ok(job_id=fin.get("job_id"), status=(
-                "failed" if fin["action"] == "train_failed"
-                else ("smoke_done" if (job or {}).get("kind") == "smoke"
-                      else "done")),
-                kind=(job or {}).get("kind"), metrics=(
-                    self._job_metrics(job) if job else {}))
-        running = self.store.jobs_running() or self.store.jobs_launching()
-        if running and not args.get("dry_run", False):
-            job = running[0]
-            return ok(job_id=job["job_id"], status="running", kind=job["kind"],
-                      estimate_usd=job["estimate_usd"])
+            status = {"train_failed": "failed",
+                      "eval_failed": "eval_failed",
+                      "eval_started": "evaluating"}.get(fin["action"])
+            if status is None:
+                status = ("smoke_done"
+                          if (job or {}).get("kind") == "smoke" else "done")
+            return ok(job_id=fin.get("job_id"), status=status,
+                      kind=(job or {}).get("kind"), metrics=(
+                          self._job_metrics(job) if job else {}))
+        if args.get("cancel"):
+            return self._dm_train_cancel(args, point)
+        if args.get("retry_eval"):
+            return self._dm_train_retry_eval(args, point)
+        running = self.store.jobs_running()
+        launching = self.store.jobs_launching()
+        if (running or launching) and not args.get("dry_run", False):
+            if running:
+                job = running[0]
+                return ok(job_id=job["job_id"], status=job["status"],
+                          kind=job["kind"], estimate_usd=job["estimate_usd"])
+            return self._launching_response(launching[0])
         dry = ap.dry_run(point)
         if args.get("dry_run", False):
             return ok(dry_run=True, kind=dry["kind"], joins=dry["joins"],
                       estimate=dry["estimate"], trigger=point["point_id"])
+        from .autopilot import _fireworks_allowed
+        if not _fireworks_allowed(point):
+            return err("remote_not_allowed",
+                       f"{point['point_id']} is private without 'fireworks' "
+                       "in remote_ok: never exported, trained or sent")
         trig_rows = next((j["n_rows"] for j in dry["joins"]
                           if j["point_id"] == point["point_id"]), 0)
         if trig_rows < self.cfg["train"]["min_train"]:
@@ -2343,6 +2528,7 @@ class Service:
                        "re-run with confirm: true to launch the job")
         est = dry["estimate"]
         headroom = ap._fireworks_headroom()
+        free_ok = False
         if dry["kind"] == "full":
             free_ok = ap.manual_free_ok(bool(args.get("training_free_confirmed")))
             counted = float(est.get("eval_usd", est["estimate_usd"])) \
@@ -2363,14 +2549,91 @@ class Service:
         from .autopilot import JobRunning
 
         try:
-            job = ap.launch_job(point, dry, counted, autopilot=False)
+            job = ap.launch_job(point, dry, counted, autopilot=False,
+                                idem=args.get("idem"), free_train=free_ok)
         except JobRunning:
-            running = self.store.jobs_running() or self.store.jobs_launching()
-            job0 = running[0] if running else {}
-            return ok(job_id=job0.get("job_id"), status="running",
+            running = self.store.jobs_running()
+            launching = self.store.jobs_launching()
+            job0 = (running or launching or [{}])[0]
+            if job0.get("status") == "launching":
+                return self._launching_response(job0)
+            return ok(job_id=job0.get("job_id"),
+                      status=job0.get("status", "running"),
                       kind=job0.get("kind"), estimate_usd=job0.get("estimate_usd", 0))
         return ok(job_id=job["job_id"], status="running", kind=job["kind"],
                   estimate_usd=job["estimate_usd"])
+
+    def _launching_response(self, job: dict) -> dict:
+        """F4: a launching poll carries (status, stale) plus the launcher
+        kind. The identity is masked to manual/autopilot: no pids or hosts
+        leak, but a second launcher can see who is on it."""
+        return ok(job_id=job["job_id"], status="launching",
+                  stale=self.autopilot._launch_stale(job),
+                  launcher=("autopilot" if job.get("autopilot") else "manual"),
+                  kind=job["kind"], estimate_usd=job["estimate_usd"])
+
+    def _dm_train_cancel(self, args: dict, point: dict) -> dict:
+        """F4: do_train cancel (a job_id, or True for this point's live job).
+
+        Kills the trainer job and marks the row cancelled: it never
+        finalizes and never relaunches."""
+        ap = self.autopilot
+        target = args.get("cancel")
+        job = None
+        if target is True:
+            live = self.store.jobs_running() + self.store.jobs_launching()
+            job = next((j for j in live
+                        if any(p.get("point_id") == point["point_id"]
+                               for p in j.get("points", []))), None)
+            if job is None:
+                return err("no_running_job",
+                           f"no launching or running job for {point['point_id']!r}")
+        else:
+            job = self.store.job_get(target)
+            if job is None:
+                return err("unknown_job", f"unknown job_id {target!r}")
+            if job["status"] not in ("running", "launching", "evaluating"):
+                return err("job_not_running",
+                           f"job {target!r} is {job['status']}")
+        tid = job["job_id"] if job["status"] == "running" \
+            else (job.get("idempotency_key") or job["job_id"])
+        out = ok(job_id=job["job_id"], status="cancelled", kind=job["kind"])
+        if self.trainer is None:
+            out["warning"] = ("no trainer: marked cancelled, but a detached "
+                              "job may still run")
+        else:
+            try:
+                self.trainer.cancel(tid)
+            except Exception as e:
+                return err("cancel_failed", f"trainer cancel failed: {e}")
+        ap._mark_cancelled(job)
+        return out
+
+    def _dm_train_retry_eval(self, args: dict, point: dict) -> dict:
+        """F8: do_train retry_eval (re-run a failed evaluation)."""
+        from .fireworks_trainer import FireworksTrainer
+
+        ap = self.autopilot
+        if not args.get("confirm", False):
+            return err("confirm_required",
+                       "re-run with confirm: true to retry the evaluation")
+        if not isinstance(self.trainer, FireworksTrainer):
+            return err("retry_not_possible",
+                       "evaluation needs the live Fireworks trainer")
+        if self.store.jobs_running() or self.store.jobs_launching():
+            return err("job_running",
+                       "another job is live; retry when it finishes")
+        cands = [j for j in self.store.jobs_eval_failed()
+                 if any(p.get("point_id") == point["point_id"]
+                        for p in j.get("points", []))]
+        if not cands:
+            return err("nothing_to_retry",
+                       f"no failed evaluation for {point['point_id']!r}")
+        job = max(cands, key=lambda j: (j.get("created_at", ""),
+                                        j.get("job_id", "")))
+        ap.retry_evaluation(job)
+        return ok(job_id=job["job_id"], status="evaluating",
+                  kind=job["kind"], estimate_usd=job["estimate_usd"])
 
     @staticmethod
     def _job_metrics(job: dict) -> dict:
@@ -2421,29 +2684,21 @@ class Service:
             return err("unknown_point", f"unknown point_id {args['point_id']!r}")
         target = args["phase"]
         if target == "shadow":
-            if not self._legacy_mode:
-                tier = point.get("tier") or ("private" if point.get(
-                    "private_model_only") else "hosted_jev")
-                if tier == "private" or point.get("private_model_only"):
-                    return self._promote_shadow_private(point)
-                return self._promote_shadow_hosted(point)
-            if self._current_model(point) is None:
-                checks = {"probe": {"pass": False,
-                                    "detail": "shadow needs a trained probe for the current version"}}
-                return err("promotion_refused", "shadow needs a trained probe",
-                           failed=["probe"], checks=checks)
-            self._autopilot_note_manual_move(point, "shadow")
-            point["phase"] = "shadow"
-            self.store.put_point(point)
-            return ok(point_id=point["point_id"], phase="shadow")
+            tier = point.get("tier") or ("private" if point.get(
+                "private_model_only") else "hosted_jev")
+            if tier == "private" or point.get("private_model_only"):
+                return self._promote_shadow_private(point)
+            return self._promote_shadow_hosted(point)
         if target == "serve":
             tier_err = self._check_promote_tier(point, args.get("tier"))
             if tier_err:
                 return tier_err
-            if self._legacy_mode:
-                eff = None
-            else:
-                eff = args.get("tier") or self._effective_tier(point)
+            eff = args.get("tier") or self._effective_tier(point)
+            pending = self._pending_private_model(point)
+            if point.get("phase") == "serve" and pending is not None \
+                    and eff == "private" and args.get("tier") is None:
+                # F9 (§7.2 step 5): switch to the pending checkpoint.
+                return self._promote_switch_pending(point, pending, args)
             checks = self._serve_checks(point, bool(args.get("confirm", False)),
                                         eff)
             failed = [k for k, v in checks.items() if not v["pass"]]
@@ -2504,21 +2759,46 @@ class Service:
         return ok(point_id=point["point_id"], phase="shadow")
 
     def _promote_shadow_private(self, point: dict) -> dict:
-        """Shadow on the private tier (§2.7): a trained private model for the
-        current version plus the Fireworks key (fakes skip the key)."""
-        model = self.store.active_model(point["point_id"], "private")
-        if model is None or model.get("point_version") != point.get(
-                "point_version", 1):
-            return err("private_tier_not_built",
-                       "shadow on the private tier needs a trained private "
-                       "model (do_train)")
+        """Shadow on the private tier (§2.7): the Fireworks key (fakes skip
+        it) plus a trained private model for the current version. The key
+        gates first: training needs it too, so a keyless point is told to
+        set the key before it is told to train."""
         if getattr(self.trainer, "needs_key", True) and not self.fireworks_key:
             return err("no_fireworks_key",
                        "set fireworks.key_ref to serve the private tier")
+        model = self.store.active_model(point["point_id"], "private")
+        if model is None or model.get("point_version") != point.get(
+                "point_version", 1):
+            return err("private_model_not_trained",
+                       "shadow on the private tier needs a trained private "
+                       "model (do_train)")
         self._autopilot_note_manual_move(point, "shadow")
         point["phase"] = "shadow"
         self.store.put_point(point)
         return ok(point_id=point["point_id"], phase="shadow")
+
+    def _promote_switch_pending(self, point: dict, pending: dict,
+                                args: dict) -> dict:
+        """F9 (§7.2 step 5): serve-to-serve switch onto the pending
+        checkpoint (§6.4 for the new checkpoint + the user's confirm)."""
+        checks = self._pending_switch_checks(
+            point, pending, bool(args.get("confirm", False)))
+        failed = [k for k, v in checks.items() if not v["pass"]]
+        if failed:
+            if not checks.get("private_item8", {}).get("pass", True):
+                return err("private_not_better",
+                           "§6.4 item 8 not met for the pending checkpoint: "
+                           "it regresses against the serving one",
+                           failed=failed, checks=checks)
+            return err("promotion_refused",
+                       f"checkpoint switch refused: {', '.join(failed)}",
+                       failed=failed, checks=checks)
+        self.store.activate_model(pending["id"])
+        if "pending_private_model" in point:
+            del point["pending_private_model"]
+        self.store.put_point(point)
+        return ok(point_id=point["point_id"], phase="serve", switched=True,
+                  checks=checks)
 
     @staticmethod
     def _note_demotion_cooldown(point: dict) -> None:
@@ -2550,15 +2830,30 @@ class Service:
         """v1.7 tier switch on promote-to-serve (item 8 in _serve_checks)."""
         if requested is None:
             return None
-        current = self._effective_tier(point)
         if requested == "hosted_jev" and point.get("private_model_only"):
             return err("privacy_conflict",
                        "a private_model_only point cannot use hosted_jev")
-        if requested == "private" and requested != current \
-                and self._legacy_mode:
-            return err("private_not_better",
-                       "no private tier on local_legacy")
         return None
+
+    @staticmethod
+    def _margin_check(n_pool: int, pool_err: float, baseline: float,
+                      target: float, min_margin: float,
+                      baseline_label: str) -> dict:
+        """Margin of the serve pool over the escalation baseline (§6.4).
+
+        When the baseline already meets the target, no margin is possible or
+        needed (a perfect model can't beat a perfect baseline), so the check
+        is skipped instead of refusing. The detail always says which rule ran.
+        """
+        if baseline <= target:
+            return {"pass": n_pool > 0,
+                    "detail": f"pool error={pool_err:.4f}, {baseline_label}="
+                              f"{baseline:.4f} already ≤ target {target}: "
+                              "margin check skipped"}
+        return {"pass": n_pool > 0
+                and pool_err <= baseline - min_margin,
+                "detail": f"pool error={pool_err:.4f}, {baseline_label}="
+                          f"{baseline:.4f}, need margin {min_margin}"}
 
     def _serve_checks(self, point: dict, confirm: bool,
                       tier: str | None = None,
@@ -2568,123 +2863,11 @@ class Service:
         since (M16, autopilot re-promotion only): live evidence rows decided
         at/before it are excluded. None (manual promotion, reports) is v1.8.
         """
-        if not self._legacy_mode:
-            eff = tier or self._effective_tier(point)
-            if eff == "private":
-                return self._serve_checks_private(point, confirm, since)
-            return self._serve_checks_hosted(point, confirm, since)
-        from . import stats as S
-        tc, sc = self.cfg["train"], self.cfg["serve"]
-        target = point.get("target_error", sc["target_error"])
-        options = list(point["options"])
-        rows = self.store.decisions_for_point(point["point_id"])
-        labeled = [(row, lab, src) for row, lab, src, _ in
-                   L.labeled_rows(rows, point, tc["teacher_only_weight"],
-                                  self.cfg["extract"]["weight"])
-                   if src in ("teacher", "outcome_correct", "outcome_ok")
-                   and row.get("source") in LIVE_SOURCES
-                   and (since is None or (row.get("ts") or "",
-                                          row.get("decision_id") or "") > since)]
-        checks: dict[str, dict] = {}
-        checks["min_examples"] = {
-            "pass": len(labeled) >= tc["min_examples"],
-            "detail": f"{len(labeled)} labelled rows, need {tc['min_examples']} "
-                      "(synthetic_gt/extracted never count)"}
-        model = self._current_model(point)
-        card = model["card"] if model else {}
-        threshold = card.get("threshold")
-        checks["threshold"] = {
-            "pass": threshold is not None,
-            "detail": f"threshold={threshold} (needs {sc['min_auto_support']} held-out cases at t)"}
-        coverage = float(card.get("coverage") or 0.0)
-        checks["coverage"] = {
-            "pass": threshold is not None and coverage >= sc["min_coverage"],
-            "detail": f"coverage={coverage:.3f}, need {sc['min_coverage']}"}
-        # evidence pool: held-out live >= t plus shadow live >= t with teacher
-        # labels. Extracted rows never count (§15.4, T-EX10). E6: on
-        # autopilot re-promotion (since set) the held-out card counts are
-        # pre-demotion evidence, so they are excluded (post-demotion shadow
-        # rows only).
-        if since is not None:
-            n_h = e_h = 0
-        else:
-            n_h = int(card.get("n_at_threshold_live", card.get("n_at_threshold")) or 0)
-            e_h = int(round(float(card.get("error_at_threshold_live",
-                                           card.get("error_at_threshold")) or 0.0)
-                            * n_h)) if n_h else 0
-        shadow_rows = [r for r in rows
-                       if r.get("phase") == "shadow" and r.get("source") in LIVE_SOURCES
-                       and r.get("point_version") == point.get("point_version", 1)
-                       and (r.get("probe") or {}).get("model_version") == card.get("model_version")
-                       and (since is None or (r.get("ts") or "",
-                                              r.get("decision_id") or "") > since)]
-        n_s = e_s = 0
-        agree_n = agree_ok = 0
-        if threshold is not None:
-            for r in shadow_rows:
-                masked = P.mask_and_renorm((r.get("probe") or {})["probabilities"],
-                                           r.get("allowed_options") or options)
-                top = P.argmax(masked, r.get("allowed_options") or options)
-                if r.get("teacher_choice"):
-                    agree_n += 1
-                    agree_ok += top == r["teacher_choice"]
-                    if max(masked.values()) >= threshold:
-                        n_s += 1
-                        e_s += top != r["teacher_choice"]
-        n_pool, e_pool = n_h + n_s, e_h + e_s
-        upper = S.wilson_upper(e_pool, n_pool) if n_pool else 1.0
-        checks["evidence"] = {
-            "pass": n_pool > 0 and upper <= target,
-            "detail": f"pool n={n_pool} (held-out {n_h} + shadow {n_s}), errors={e_pool}, "
-                      f"Wilson upper={upper:.4f}, target={target}"}
-        baseline = float(card.get("random_baseline_error", 1.0))
-        pool_err = (e_pool / n_pool) if n_pool else 1.0
-        checks["margin"] = {
-            "pass": n_pool > 0 and pool_err <= baseline - sc["min_margin_vs_random"],
-            "detail": f"pool error={pool_err:.4f}, random baseline={baseline:.4f}, "
-                      f"need margin {sc['min_margin_vs_random']}"}
-        checks["shadow"] = {
-            "pass": len(shadow_rows) >= sc["min_shadow"],
-            "detail": f"{len(shadow_rows)} shadow decisions with current probe, "
-                      f"need {sc['min_shadow']}"}
-        held_acc = float(card.get("probe_accuracy", 0.0))
-        shadow_agree = (agree_ok / agree_n) if agree_n else None
-        checks["shadow_agreement"] = {
-            "pass": shadow_agree is not None and abs(shadow_agree - held_acc) <= 0.05,
-            "detail": f"shadow agreement={shadow_agree}, held-out={held_acc:.3f} "
-                      f"(need within 0.05, {agree_n} labelled shadow rows)"}
-        both, disagree = L.teacher_disagreement(rows)
-        unreliable = both > 0 and disagree / both > tc["teacher_alarm"]
-        checks["teacher"] = {
-            "pass": not unreliable,
-            "detail": f"outcome/teacher disagreements {disagree}/{both} "
-                      f"(alarm above {tc['teacher_alarm']})"}
-        checks["confirm"] = {"pass": bool(confirm),
-                             "detail": "the user agreed" if confirm else "confirm: true required"}
-        labelled, decided = self._shadow_label_coverage_legacy(point, since)
-        ratio = labelled / decided if decided else 0.0
-        checks["labelled_ratio"] = {
-            "pass": decided > 0 and ratio >= 0.9,
-            "detail": f"{labelled}/{decided} decided shadow rows labelled "
-                      f"(ratio {ratio:.3f}, need 0.90)"}
-        if point.get("source") == "gateway":
-            from . import gateway as GW
-            fe = GW.format_evidence(self.cfg, self.store, point)
-            gcfg = self.cfg["gateway"]
-            n_ok = fe["n_compared"] >= gcfg["format_min_n"]
-            wl = fe["wilson_lower"]
-            w_ok = wl is not None and wl >= gcfg["format_match_min"]
-            ur = fe["unparsed_rate"]
-            u_ok = ur is not None and ur <= gcfg["max_unparsed"]
-            checks["gateway_format"] = {
-                "pass": n_ok and w_ok and u_ok,
-                "detail": (f"compared={fe['n_compared']}/{gcfg['format_min_n']}, "
-                           f"match {fe['n_match']}/{fe['n_compared']} "
-                           f"(Wilson lower {_fmt_num(wl)}, need "
-                           f"{gcfg['format_match_min']}), unparsed "
-                           f"{fe['n_unparsed']}/{fe['n_answered']} "
-                           f"({_fmt_num(ur)}, max {gcfg['max_unparsed']})")}
-        return checks
+        eff = tier or self._effective_tier(point)
+        if eff == "private":
+            return self._serve_checks_private(point, confirm, since)
+        return self._serve_checks_hosted(point, confirm, since)
+
 
     def _serve_checks_hosted(self, point: dict, confirm: bool,
                              since: tuple | None = None) -> dict:
@@ -2724,12 +2907,9 @@ class Service:
                if scored else 0.0)
         baseline = 1.0 - acc
         pool_err = (e_pool / n_pool) if n_pool else 1.0
-        checks["margin"] = {
-            "pass": n_pool > 0
-            and pool_err <= baseline - sc["min_margin_vs_random"],
-            "detail": f"pool error={pool_err:.4f}, evidence baseline="
-                      f"{baseline:.4f}, need margin "
-                      f"{sc['min_margin_vs_random']}"}
+        checks["margin"] = self._margin_check(
+            n_pool, pool_err, baseline, target, sc["min_margin_vs_random"],
+            "evidence baseline")
         checks["shadow"] = {
             "pass": len(ev) >= sc["min_shadow"],
             "detail": f"{len(ev)} evidence rows, need {sc['min_shadow']}"}
@@ -2816,11 +2996,9 @@ class Service:
                if scored else 0.0)
         baseline = 1.0 - acc
         pool_err = (e_pool / n_pool) if n_pool else 1.0
-        checks["margin"] = {
-            "pass": n_pool > 0
-            and pool_err <= baseline - sc["min_margin_vs_random"],
-            "detail": f"pool error={pool_err:.4f}, C baseline={baseline:.4f},"
-                      f" need margin {sc['min_margin_vs_random']}"}
+        checks["margin"] = self._margin_check(
+            n_pool, pool_err, baseline, target, sc["min_margin_vs_random"],
+            "C baseline")
         checks["shadow"] = {
             "pass": n >= sc["min_shadow"],
             "detail": f"{n} comparison rows, need {sc['min_shadow']}"}
@@ -2886,23 +3064,25 @@ class Service:
             return err("unknown_point", f"unknown point_id {args['point_id']!r}")
         target = args["plan_phase"]
         if target == "shadow":
-            if not self._legacy_mode and self._hosted_tier(point):
-                # C1: hosted plan shadow needs no trained probe; the key,
+            if self._hosted_tier(point):
+                # C1: hosted plan shadow needs no trained model; the key,
                 # budget and privacy gate admit it, as for decide shadow.
                 gate = self._hosted_shadow_gate(point, "plan ")
                 if gate is not None:
                     return gate
-                point["plan_phase"] = "shadow"
-                self.store.put_point(point)
-                return ok(point_id=point["point_id"], plan_phase="shadow")
-            if self._current_plan_model(point) is None:
-                checks = {"plan_probe": {
-                    "pass": False,
-                    "detail": "plan shadow needs a trained plan probe "
-                              "for the current version"}}
-                return err("promotion_refused",
-                           "plan shadow needs a trained plan probe",
-                           failed=["plan_probe"], checks=checks)
+            else:
+                if getattr(self.trainer, "needs_key", True) \
+                        and not self.fireworks_key:
+                    return err("no_fireworks_key",
+                               "set fireworks.key_ref to serve the private "
+                               "tier")
+                model = self.store.active_model(point["point_id"],
+                                                "private")
+                if model is None or model.get("point_version") != point.get(
+                        "point_version", 1):
+                    return err("private_model_not_trained",
+                               "plan shadow on the private tier needs a "
+                               "trained private model (do_train)")
             point["plan_phase"] = "shadow"
             self.store.put_point(point)
             return ok(point_id=point["point_id"], plan_phase="shadow")
@@ -2924,89 +3104,8 @@ class Service:
 
     def _plan_serve_checks(self, point: dict, confirm: bool) -> dict:
         """Promotion criteria of §15.6 (§6.4 restated for plans)."""
-        if not self._legacy_mode and self._hosted_tier(point):
-            return self._plan_serve_checks_hosted(point, confirm)
-        from . import stats as S
-        from . import train as TR
-        tc = self.cfg["train"]
-        target = self.cfg["plan"]["target_error"]
-        rows = self.store.decisions_for_point(point["point_id"])
-        labeled = L.labeled_rows(rows, point, tc["teacher_only_weight"],
-                                 self.cfg["extract"]["weight"])
-        gate = TR.extraction_gate(self.cfg, self.store, point)
-        plan_flags = self.store.transcript_plan_flags(point["workflow"])
-        eval_ids = self.store.eval_only_transcript_ids(point["workflow"])
-        n_start = 0
-        for row, _, src, _ in labeled:
-            if not row.get("at_start"):
-                continue  # unknown is not at_start (B14)
-            if src == "extracted" and not gate["passed"]:
-                continue
-            if (row.get("transcript_id") or "") in eval_ids:
-                continue  # eval-only runs never count
-            f = plan_flags.get(row.get("transcript_id") or "")
-            if f and (f["injected"] or f["pilot"]):
-                continue  # injected/pilot runs never count (B12)
-            n_start += 1
-        checks: dict[str, dict] = {}
-        checks["min_examples"] = {
-            "pass": n_start >= tc["min_examples"],
-            "detail": f"{n_start} at_start rows passing the gate, "
-                      f"need {tc['min_examples']}"}
-        card = self._plan_card(point) or {}
-        pt = card.get("plan_threshold")
-        checks["threshold"] = {
-            "pass": pt is not None,
-            "detail": f"plan_threshold={pt}"}
-        coverage = float(card.get("plan_coverage") or 0.0)
-        checks["coverage"] = {
-            "pass": pt is not None and coverage >= self.cfg["serve"]["min_coverage"],
-            "detail": f"plan coverage={coverage:.3f}, "
-                      f"need {self.cfg['serve']['min_coverage']}"}
-        pool = self._plan_evidence_pool(point)
-        n_pool = len(pool)
-        e_pool = sum(1 for m, _ in pool if not m)
-        kinds: dict[str, int] = {}
-        for _, kind in pool:
-            kinds[kind] = kinds.get(kind, 0) + 1
-        upper = S.wilson_upper(e_pool, n_pool) if n_pool else 1.0
-        checks["evidence"] = {
-            "pass": n_pool > 0 and upper <= target,
-            "detail": f"pool n={n_pool}, errors={e_pool}, "
-                      f"Wilson upper={upper:.4f}, target={target}; "
-                      f"label kinds: {kinds or 'none'}"}
-        baseline = 1.0 - float(card.get("plan_probe_accuracy")
-                               if card.get("plan_probe_accuracy") is not None
-                               else 0.0)
-        pool_err = (e_pool / n_pool) if n_pool else 1.0
-        checks["margin"] = {
-            "pass": n_pool > 0 and pool_err <= baseline - self.cfg["serve"]["min_margin_vs_random"],
-            "detail": f"pool error={pool_err:.4f}, baseline={baseline:.4f}, "
-                      f"need margin {self.cfg['serve']['min_margin_vs_random']}"}
-        checks["shadow"] = {
-            "pass": n_pool >= self.cfg["plan"]["min_shadow"],
-            "detail": f"{n_pool} shadow comparisons, "
-                      f"need {self.cfg['plan']['min_shadow']}"}
-        held_agree = card.get("plan_heldout_agreement")
-        shadow_agree = (1.0 - e_pool / n_pool) if n_pool else None
-        checks["shadow_agreement"] = {
-            "pass": (shadow_agree is not None and held_agree is not None
-                     and abs(shadow_agree - held_agree) <= 0.05),
-            "detail": f"shadow agreement={shadow_agree}, "
-                      f"held-out={held_agree} (need within 0.05)"}
-        checks["extraction"] = {
-            "pass": not point.get("extraction_unreliable", False),
-            "detail": ("extraction_unreliable" if point.get(
-                "extraction_unreliable", False) else "extraction reliable")}
-        both, disagree = L.teacher_disagreement(rows)
-        unreliable = both > 0 and disagree / both > tc["teacher_alarm"]
-        checks["teacher"] = {
-            "pass": not unreliable,
-            "detail": f"outcome/teacher disagreements {disagree}/{both} "
-                      f"(alarm above {tc['teacher_alarm']})"}
-        checks["confirm"] = {"pass": bool(confirm),
-                             "detail": "the user agreed" if confirm else "confirm: true required"}
-        return checks
+        return self._plan_serve_checks_hosted(point, confirm)
+
 
     def _plan_serve_checks_hosted(self, point: dict,
                                     confirm: bool) -> dict:
@@ -3049,11 +3148,9 @@ class Service:
                if scored else 0.0)
         baseline = 1.0 - acc
         pool_err = (e_pool / n_pool) if n_pool else 1.0
-        checks["margin"] = {
-            "pass": n_pool > 0
-            and pool_err <= baseline - self.cfg["serve"]["min_margin_vs_random"],
-            "detail": f"pool error={pool_err:.4f}, baseline={baseline:.4f}, "
-                      f"need margin {self.cfg['serve']['min_margin_vs_random']}"}
+        checks["margin"] = self._margin_check(
+            n_pool, pool_err, baseline, target,
+            self.cfg["serve"]["min_margin_vs_random"], "baseline")
         checks["shadow"] = {
             "pass": len(ev) >= self.cfg["plan"]["min_shadow"],
             "detail": f"{len(ev)} evidence comparisons, "
@@ -3333,17 +3430,22 @@ class Service:
         errors = SV.validate("do_analyze", args) if isinstance(args, dict) else ["<root>: not an object"]
         if errors:
             return err("invalid_args", "; ".join(errors[:3]))
-        if "workflow" not in args and "traces" not in args and not args.get("gateway"):
-            return err("invalid_args", "do_analyze needs workflow, traces or gateway")
+        if "workflow" not in args and "traces" not in args \
+                and "code" not in args and not args.get("gateway"):
+            return err("invalid_args",
+                       "do_analyze needs workflow, traces, code or gateway")
         out: dict = {"points": [], "rubric": AN.RUBRIC,
                      "candidate_schema": AN.candidate_schema()}
         if args.get("gateway"):
             return self._dm_analyze_gateway(args, out)
+        workflow_text = None
         if "workflow" in args:
             text = self._workflow_text(args["workflow"])
             if isinstance(text, dict):  # error dict
                 return text
             out["hints"] = AN.find_hints(text)
+            workflow_text = text
+        trace_calls = None
         if "traces" in args:
             calls = self._trace_calls(args["traces"])
             if isinstance(calls, dict):
@@ -3351,8 +3453,33 @@ class Service:
             points, stats = AN.detect_traces(calls, self.cfg)
             out["points"].extend(points)
             out["trace_stats"] = stats
-        for cand in args.get("candidates") or []:
-            out["points"].append(AN.score_candidate(cand, self.cfg))
+            trace_calls = calls
+        scored_agent = [(cand, AN.score_candidate(cand, self.cfg))
+                        for cand in args.get("candidates") or []]
+        for _, scored in scored_agent:
+            out["points"].append(scored)
+        static_cands: list[dict] = []
+        if "code" in args:
+            from .discovery import static_py as SP
+            static_cands = SP.find_static_candidates(args["code"], self.cfg)
+        behaviour_res = None
+        if trace_calls is not None:
+            from .discovery import behaviour as BH
+            if BH.has_new_trace_fields(trace_calls):
+                behaviour_res = BH.detect_behaviour(trace_calls, self.cfg)
+        if "code" in args or behaviour_res is not None:
+            from .discovery import merge as MG
+            text_cands = MG.text_candidates(out.get("hints", []),
+                                            workflow_text or "")
+            merged = MG.merge(
+                static_cands,
+                behaviour_res["candidates"] if behaviour_res else [],
+                text_cands if workflow_text is not None else [],
+                scored_agent)
+            out["discovery"] = {
+                "candidates": merged,
+                "rejected": behaviour_res["rejected"] if behaviour_res else [],
+            }
         return ok(**out)
 
     def _dm_analyze_gateway(self, args: dict, out: dict) -> dict:
@@ -3621,74 +3748,20 @@ class Service:
         if len(allowed) == 1:
             entry.update(choice=allowed[0], confidence=1.0,
                          rule=hits[-1] if hits else None, predicted=True)
-            decided = self._plan_decided_hosted if not self._legacy_mode \
-                else self._plan_decided
-            if decided(point, entry, pilot, via_rule=True):
+            if self._plan_decided_hosted(point, entry, pilot, via_rule=True):
                 entry["status"] = "decided"
             return entry, warns
         if missing or type_errors:
             return entry, warns
         if point.get("irreversible") and not self.cfg["serve"]["allow_auto_irreversible"]:
             return entry, warns
-        if not self._legacy_mode:
-            return self._plan_predict_hosted(point, task_input, validated,
-                                             allowed, entry, warns, pilot)
-        card = self._plan_card(point)
-        if card is None or not card.get("plan_eligible"):
-            return entry, warns
-        model = self._current_plan_model(point)
-        if model is None:
-            return entry, warns
-        state = (task_input + "\n" + R.render_state(point, validated)
-                 if task_input else R.render_state(point, validated))
-        try:
-            decider = self._decider_for(point)
-            assert decider is not None
-            res = decider.decide(
-                [self._decide_request(point, validated, state_text=state)],
-                model_kind="plan")[0]
-        except (JevError, DeciderError):
-            warns.append(f"{point['point_id']}: jev_unavailable")
-            return entry, warns
-        probe_full = res._probe_full
-        if probe_full is None:
-            warns.append(f"{point['point_id']}: plan model unreadable")
-            return entry, warns
-        masked = P.mask_and_renorm(probe_full, allowed)
-        if not masked:
-            return entry, warns
-        top = P.argmax(masked, allowed)
-        entry.update(choice=top, confidence=max(masked.values()), predicted=True)
-        card = self._plan_card(point) or {}
-        entry["teacher_only"] = top in (card.get("teacher_only_options") or [])
-        if self._plan_decided(point, entry, pilot, via_rule=False):
-            entry["status"] = "decided"
-        return entry, warns
-
-    def _plan_decided(self, point: dict, entry: dict, pilot: bool,
-                      via_rule: bool) -> bool:
-        if not pilot and point.get("plan_phase", "collect") != "serve":
-            return False
-        if via_rule:
-            return True  # deterministic rules bypass threshold/teacher_only
-        if not pilot:
-            card = self._plan_card(point) or {}
-            pt = card.get("plan_threshold")
-            if pt is None or (entry.get("confidence") or 0.0) < pt:
-                return False
-            if entry.get("choice") in (card.get("teacher_only_options") or []):
-                return False
-        # pilot_force (§15.9) injects the argmax with no serve gating, so the
-        # pilot exercises the mechanism; teacher_only choices stay flagged
-        # on the entry for the report.
-        return True
+        return self._plan_predict_hosted(point, task_input, validated,
+                                         allowed, entry, warns, pilot)
 
     # -- hosted plan path (build §9, G3) -----------------------------------
     def _plan_decider_for(self, point: dict):
         """Plan decider: tier + privacy only (plan_phase gates the call, not
         the point's decide phase)."""
-        if self._legacy_mode:
-            return next(iter(self.deciders.values()))
         if point.get("private_model_only"):
             return self.deciders.get("private")
         if (point.get("tier") or "hosted_jev") == "private":
@@ -3716,6 +3789,7 @@ class Service:
             self.cfg["extract"]["weight"])
         gate: dict | None = None
         plan_flags = self.store.transcript_plan_flags(point["workflow"])
+        eval_only = self.store.eval_only_transcript_ids(point["workflow"])
         clean = []
         for r, _, src, _ in labeled:
             if src == "extracted":
@@ -3723,6 +3797,8 @@ class Service:
                     gate = TR.extraction_gate(self.cfg, self.store, point)
                 if not gate["passed"]:
                     continue
+            if (r.get("transcript_id") or "") in eval_only:
+                continue  # P2 parity: eval-only runs never count
             f = plan_flags.get(r.get("transcript_id") or "")
             if f and (f["injected"] or f["pilot"]):
                 continue
@@ -3757,29 +3833,28 @@ class Service:
                 point, validated,
                 task_input=task_input or None, state_text=None)
             res = decider.decide([req])[0]
-        except (JevError, DeciderError) as e:
+        except DeciderError as e:
             # C3: the plan path surfaces hosted failures like do_decide
             # does, so prereg can tell no key / no budget / down apart
             # instead of marking every ticket silently unpredicted.
             tag = "jev_unavailable"
-            if isinstance(e, DeciderError):
-                if e.code == "remote_not_allowed":
-                    # R2-10: unlike do_decide's collect-like silence, a plan
-                    # row blocked by privacy must warn so P3 counts it as a
-                    # failure instead of silently unpredicted.
-                    warns.append(f"{point['point_id']}: remote_not_allowed")
-                    return entry, warns
-                record_hosted_error(self.store, point["point_id"], e)
-                tag = {"budget_exceeded": "budget_exceeded",
-                       "no_key": "no_hosted_jev_key"}.get(e.code, tag)
+            if e.code == "remote_not_allowed":
+                # R2-10: unlike do_decide's collect-like silence, a plan
+                # row blocked by privacy must warn so P3 counts it as a
+                # failure instead of silently unpredicted.
+                warns.append(f"{point['point_id']}: remote_not_allowed")
+                return entry, warns
+            record_decider_error(self.store, decider, point["point_id"], e)
+            tag = {"budget_exceeded": "budget_exceeded",
+                   "no_key": "no_hosted_jev_key"}.get(e.code, tag)
             warns.append(f"{point['point_id']}: {tag}")
             return entry, warns
         T = 1.0
-        fit = self._hosted_fit(point, "plan")
+        fit = self._plan_fit_for(point)
         if fit is not None:
             T = float(fit["temperature"])
         masked = HF.mask_temper(res.probs, allowed, T)
-        top = P.argmax(masked, allowed)
+        top = S.argmax(masked, allowed)
         entry.update(choice=top, confidence=max(masked.values())
                      if masked else 0.0, predicted=True,
                      probabilities=dict(res.probs), decider=res.decider,
@@ -3799,6 +3874,21 @@ class Service:
             return False
         if via_rule:
             return True
+        if self._effective_tier(point) == "private":
+            # GP7: private-tier plan decisions stay open until a private
+            # plan fit has a threshold; pilot_force never bypasses this.
+            fit = self._private_plan_fit(point)
+            if fit is None or fit.get("threshold") is None:
+                return False
+            if pilot:
+                return True
+            pt = fit["threshold"]
+            if (entry.get("confidence") or 0.0) < pt:
+                return False
+            if entry.get("choice") in (fit.get("teacher_only_options")
+                                       or []):
+                return False
+            return True
         if not pilot:
             fit = self._hosted_fit(point, "plan")
             pt = (fit or {}).get("threshold")
@@ -3808,19 +3898,6 @@ class Service:
                     "teacher_only_options") or []):
                 return False
         return True
-
-    def _plan_card(self, point: dict) -> dict | None:
-        model = self._current_plan_model(point)
-        if model is not None:
-            return model["card"]
-        probe = self._current_model(point)
-        return probe["card"] if probe else None
-
-    def _current_plan_model(self, point: dict) -> dict | None:
-        model = self.store.active_model(point["point_id"], "plan")
-        if model is None or model.get("point_version") != point.get("point_version", 1):
-            return None
-        return model
 
     @staticmethod
     def _public_entry(e: dict) -> dict:
@@ -4212,40 +4289,9 @@ class Service:
                         "phase": e.get("phase"), "label": label, "kind": kind,
                         "match": e["choice"] == label,
                         "probabilities": e.get("probabilities"),
+                        "decider": e.get("decider"),
                         "allowed_options": e.get("allowed_options")})
         return out
-
-    def _plan_evidence_pool(self, point: dict) -> list[tuple[bool, str]]:
-        """Shadow comparisons at or above the plan threshold (§15.6 item 3)."""
-        from . import train as TR
-        card = self._plan_card(point) or {}
-        pt = card.get("plan_threshold")
-        if pt is None:
-            return []
-        gate: dict | None = None
-        pool = []
-        for plan in self.store.plans_for_workflow(point["workflow"]):
-            if plan.get("pilot_forced") or plan.get("audit"):
-                continue
-            if plan.get("trial_id") or plan.get("pair_id"):
-                continue
-            for c in self._plan_comparisons(plan):
-                if c["point_id"] != point["point_id"]:
-                    continue
-                if c["phase"] != "shadow":
-                    continue
-                if c["confidence"] is None or c["confidence"] < pt:
-                    continue
-                if c["kind"] == "extracted":
-                    if gate is None:
-                        # D: same laziness as the hosted comparisons: the
-                        # gate scan runs only for extracted comparisons.
-                        gate = TR.extraction_gate(
-                            self.cfg, self.store, point)
-                    if not gate["passed"]:
-                        continue
-                pool.append((c["match"], c["kind"]))
-        return pool
 
     def _plan_point_failed(self, plan: dict, point_id: str) -> bool:
         """A conflict naming the point, or a decision-level outcome failure
@@ -4279,7 +4325,7 @@ class Service:
                 continue
             if plan.get("trial_id") or plan.get("pair_id"):
                 continue
-            if (plan["ts"], plan["plan_id"]) < (epoch, ""):
+            if plan["ts"] < epoch:
                 continue
             for c in self._plan_comparisons(plan):
                 if c["point_id"] == point_id and c["phase"] == "serve":
@@ -4325,8 +4371,135 @@ class Service:
         return False
 
     # -- do_report -------------------------------------------------------
+    def _private_report_block(self, point: dict) -> dict:
+        """do_report's private-tier block (F9). Model names print as the
+        tail only (GP9); the full ref never leaves the card."""
+        import statistics
+
+        from .trainer_log import redact_account
+
+        pid = point["point_id"]
+        month = time.strftime("%Y-%m", time.gmtime())
+        spend = self.store.spend_get(month, "fireworks")
+        budget = float(self.cfg["fireworks"].get("monthly_budget_usd") or 0)
+        ver = point.get("point_version", 1)
+        rows = [r for r in self.store.decisions_for_point(pid)
+                if r.get("decider") == "private"
+                and r.get("point_version") == ver]
+        lats = sorted(r["jev_seconds"] for r in rows
+                      if isinstance(r.get("jev_seconds"), (int, float)))
+
+        def _model_block(card: dict) -> dict | None:
+            if not card:
+                return None
+            metrics = card.get("metrics", {}) or {}
+            ref = card.get("model_ref") or card.get("sampler") or None
+            return {
+                "model": redact_account(ref) if ref else None,
+                "temperature": card.get("temperature"),
+                "job_id": card.get("job_id"),
+                "accuracy": card.get("accuracy"),
+                "n_holdout": metrics.get("n_holdout"),
+                "threshold": card.get("threshold")}
+
+        model = self.store.active_model(pid, "private")
+        card = {}
+        if model is not None and model.get("point_version") == ver:
+            card = model.get("card", {})
+        pending = self._pending_private_model(point)
+        blocked = None
+        if (card or pending) and not self._hosted_tier(point) \
+                and not self.cfg["fireworks"].get("allow_session_serving",
+                                                 False):
+            # GP11: a trained private-tier point with the serving gate
+            # closed stays collect; the report says so either way.
+            blocked = "serving_not_allowed"
+        return {
+            "blocked": blocked,
+            "model": _model_block(card),
+            "pending_model": _model_block((pending or {}).get("card", {})),
+            "calls": len(rows),
+            "median_latency_s": (statistics.median(lats) if lats else None),
+            "calls_month": spend["calls"],
+            "spend_month_usd": spend["usd"], "budget_usd": budget,
+            "budget_warning_80": bool(budget and spend["usd"] >= 0.8 * budget),
+            "warming": self.store.counter_get("private_warming", pid),
+            "errors": {
+                "timeout": self.store.counter_get(
+                    "private_error_timeout", pid),
+                "bad_response": self.store.counter_get(
+                    "private_error_bad_response", pid),
+                "unavailable": self.store.counter_get(
+                    "private_error_unavailable", pid)},
+            "measured": False,  # unmeasured until L3 reconciles the bill
+        }
+
+    def _fireworks_report_block(self) -> dict:
+        """do_report's Fireworks-global block (F9): the live job, the
+        worker sessions, the cookbook pin and the serving gate."""
+        from datetime import datetime, timezone
+
+        from .fireworks_trainer import FireworksTrainer
+
+        pin = getattr(self.trainer, "pin_status", None)
+        if callable(pin):
+            pin = self.trainer.pin_status()
+        else:
+            pin = FireworksTrainer(
+                self.cfg, self.store.root / "jobs").pin_status()
+        fw = self.cfg["fireworks"]
+        try:
+            budget = float(fw.get("monthly_budget_usd") or 0)
+        except (TypeError, ValueError):
+            budget = 0.0
+        serving = bool(fw.get("allow_session_serving", False)) \
+            and budget > 0
+        live = self.store.jobs_running() + self.store.jobs_launching()
+        cur = None
+        if live:
+            job = live[0]
+            prog: dict = {}
+            if self.trainer is not None:
+                try:
+                    prog = self.trainer.progress(job["job_id"]) or {}
+                except Exception:
+                    prog = {}
+            try:
+                created = datetime.fromisoformat(job.get("created_at", ""))
+                elapsed = (datetime.now(timezone.utc) - created
+                           ).total_seconds()
+            except (TypeError, ValueError):
+                elapsed = None
+            cur = {"job_id": job["job_id"], "kind": job["kind"],
+                   "state": job["status"], "elapsed_s": elapsed,
+                   "step": prog.get("step"), "loss": prog.get("loss"),
+                   "eval_accuracy": prog.get("eval_accuracy")}
+        dec = self.deciders.get("private")
+        if dec is None:
+            worker = None
+        elif hasattr(dec, "sessions_summary"):
+            worker = {"sessions": dec.sessions_summary()}
+        else:
+            worker = {"backend": getattr(dec, "name", "fake")}
+        return {"current_job": cur, "worker": worker, "pin": pin,
+                "serving_allowed": serving}
+
+    @staticmethod
+    def _redact_report(obj):
+        """GP9 backstop: mask account ids anywhere in a report payload."""
+        from .trainer_log import redact_account
+
+        if isinstance(obj, str):
+            return redact_account(obj)
+        if isinstance(obj, list):
+            return [Service._redact_report(v) for v in obj]
+        if isinstance(obj, dict):
+            return {k: Service._redact_report(v) for k, v in obj.items()}
+        return obj
+
     def do_report(self, args: dict) -> dict:
         from . import report as RP
+        from .trainer_log import redact_account
         errors = SV.validate("do_report", args) if isinstance(args, dict) else ["<root>: not an object"]
         if errors:
             return err("invalid_args", "; ".join(errors[:3]))
@@ -4337,10 +4510,15 @@ class Service:
             if not self.store.list_points(wf) and self.store.get_workflow(wf) is None:
                 return err("unknown_workflow", f"unknown workflow {wf!r}")
             rep = RP.workflow_report(self.cfg, self.store, wf)
+            fw = self._fireworks_report_block()
             if args.get("format") == "md":
-                return ok(format="md", report=RP.render_autopilot_md(
-                    self.autopilot.block()) + RP.render_workflow_md(rep))
-            return ok(workflow=rep, autopilot=self.autopilot.block())
+                return ok(format="md", report=redact_account(
+                    RP.render_autopilot_md(self.autopilot.block())
+                    + RP.render_fireworks_md(fw)
+                    + RP.render_workflow_md(rep)))
+            return ok(**self._redact_report(
+                {"workflow": rep, "autopilot": self.autopilot.block(),
+                 "fireworks": fw}))
         if args.get("point_id") is not None:
             point = self.store.get_point(args["point_id"])
             if point is None:
@@ -4353,14 +4531,18 @@ class Service:
             rep = RP.point_report(self.cfg, self.store, p,
                                   self._serve_checks(p, True))
             rep["tier"] = self._effective_tier(p)
-            rep["hosted"] = None if self._legacy_mode \
-                else self._hosted_report_block(p)
+            rep["hosted"] = self._hosted_report_block(p)
+            rep["private"] = self._private_report_block(p)
             rep["autopilot"], _ = self.autopilot.point_status(p)
             reps.append(rep)
+        fw = self._fireworks_report_block()
         if args.get("format") == "md":
-            return ok(format="md", report=RP.render_autopilot_md(
-                self.autopilot.block()) + RP.render_md(reps))
-        return ok(points=reps, autopilot=self.autopilot.block())
+            return ok(format="md", report=redact_account(
+                RP.render_autopilot_md(self.autopilot.block())
+                + RP.render_fireworks_md(fw) + RP.render_md(reps)))
+        return ok(**self._redact_report(
+            {"points": reps, "autopilot": self.autopilot.block(),
+             "fireworks": fw}))
 
     # -- do_autopilot_status (M16, read-only) ------------------------------
     def do_autopilot_status(self, args: dict) -> dict:
@@ -4419,6 +4601,7 @@ class Service:
             return ok(decision_id=row["decision_id"], ignored=True)
         self._maybe_fit_hosted(row["point_id"])
         self._maybe_fit_hosted(row["point_id"], "plan")
+        self._maybe_fit_private_plan(row["point_id"])
         if row.get("transcript_id"):
             for plan in self.store.plans_for_transcript_link(row["transcript_id"]):
                 if plan.get("audit"):

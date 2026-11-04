@@ -1,0 +1,38 @@
+/path/to/cookbook/training/.venv/lib/python3.14/site-packages/fireworks/training/sdk/_core/_compat.py:46: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.typing import (
+2026-11-02 09:48:02,992 INFO ServiceClient initialized for session ts-test…
+2026-11-02 09:48:15,779 INFO Created model run-test…:train:0 (lora_rank=64)
+2026-11-02 09:48:16,235 INFO Auto-resolved account ID: acct-test
+2026-11-02 09:48:16,235 INFO FiretitanTrainingClient session_id: 18145e12
+2026-11-02 09:48:16,759 INFO Auto-resolved account ID: acct-test
+2026-11-02 09:48:16,759 INFO Serverless training session ts-test…, run run-test…. To continue from one of this run's checkpoints in a new process, pass init_from_checkpoint='acct-test/run-test…/<checkpoint>' with the same log_path.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-11-02 09:48:16,909 WARNING Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-11-02 09:48:20,922 INFO Auto-selected 4 render workers: cpu=15 (quota=0 affinity=0 host=15) max=16 tasks=32 cgroup=0.0/0.0 GiB host_available=0.0/0.0 GiB base=8.0 GiB reserve=8.0 GiB per_worker=10.0 GiB
+2026-11-02 09:48:22,151 INFO Starting at step 0 from base model (no checkpoint)
+2026-11-02 09:50:33,338 INFO [Eval] step 0 | K-way NLL 0.9780 | accuracy 0.7667
+{"type": "metrics", "step": 0, "eval_loss": 0.9779605923542674, "eval_accuracy": 0.7666666666666667}
+/path/to/cookbook/training/.venv/lib/python3.14/site-packages/fireworks/training/sdk/_core/_compat.py:46: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.typing import (
+/path/to/cookbook/training/.venv/lib/python3.14/site-packages/fireworks/training/sdk/_core/_compat.py:46: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.typing import (
+/path/to/cookbook/training/.venv/lib/python3.14/site-packages/fireworks/training/sdk/_core/_compat.py:46: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.typing import (
+/path/to/cookbook/training/.venv/lib/python3.14/site-packages/fireworks/training/sdk/_core/_compat.py:46: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.typing import (
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+{"type": "metrics", "step": 1, "kway_loss": 0.43205944697062176, "lr": 0.0001}
+{"type": "metrics", "step": 2, "kway_loss": 1.8118771314620972, "lr": 0.0001}
+{"type": "metrics", "step": 3, "kway_loss": 0.9134923219680786, "lr": 0.0001}
+{"type": "metrics", "step": 4, "kway_loss": 0.4719843864440918, "lr": 0.0001}
+2026-11-02 09:56:32,684 INFO [Eval] step 4 | K-way NLL 0.3390 | accuracy 0.8867
+{"type": "metrics", "step": 4, "eval_loss": 0.3390460629581563, "eval_accuracy": 0.8866666666666667}
+2026-11-02 09:56:32,686 INFO Saving DCP checkpoint 'step-4'...
+2026-11-02 09:57:37,575 INFO DCP checkpoint 'step-4' saved (64.9s)
+2026-11-02 10:00:10,880 INFO Decision calibration: T={'choice': 1.0059159722032391}
+2026-11-02 10:00:12,511 INFO Saving sampler checkpoint 'step-4-cal'...
+2026-11-02 10:01:26,570 INFO Sampler checkpoint 'step-4-cal' saved (74.1s)
+2026-11-02 10:01:28,042 INFO Sampler server-stored name 'run-test…-step-4-cal-18145e12' differs from caller name 'step-4-cal'; using control-plane row for subsequent promotion.

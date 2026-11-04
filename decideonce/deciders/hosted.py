@@ -181,8 +181,8 @@ class UrllibTransport:
 class FakeHostedTransport:
     """Test transport (build §4): fn(body) -> (status, json); records bodies.
 
-    The default fn plants FakeJev-style signal: with probability `accuracy`
-    the distribution is peaked on the state's label_hint field, else on
+    The default fn plants signal: with probability `accuracy` the
+    distribution is peaked on the state's label_hint field, else on
     another option. fn may raise DeciderError (e.g. timeout) to script
     failures.
     """
@@ -258,8 +258,7 @@ class HostedJevDecider(Decider):
         from ..config import ConfigError
         if store is None and not allow_no_store:
             # B9: without a store there is no budget and no privacy gate.
-            raise TypeError("HostedJevDecider requires a store "
-                            "(tests may pass allow_no_store=True)")
+            raise TypeError("HostedJevDecider requires a store")
         try:
             budget = float(monthly_budget_usd or 0)
             reserve = float(reserve_usd)
@@ -490,7 +489,6 @@ def build_hosted_deciders(cfg: dict, store):
     refuse startup (decider_host_not_allowed, pack_not_supported,
     budget_below_reservation)."""
     from ..config import ConfigError
-    from ..jev import FakeJev
     from .fake import FakeDecider
 
     hj = cfg["hosted_jev"]
@@ -526,8 +524,7 @@ def build_hosted_deciders(cfg: dict, store):
     backend = cfg.get("decider", {}).get("backend", "tiered")
     if backend == "fake":
         fake_transport = FakeHostedTransport(
-            accuracy=float(hj.get("fake_accuracy", 0.97)))
-        fake_jev = FakeJev()
+            accuracy=float(hj.get("fake_accuracy", 1.0)))
         return {
             "hosted_jev": HostedJevDecider(
                 url=hj["url"], model=hj["model"], key="fake", store=store,
@@ -536,16 +533,28 @@ def build_hosted_deciders(cfg: dict, store):
                 monthly_budget_usd=budget, reserve_usd=reserve,
                 stale_after_s=stale_after_s,
                 transport=fake_transport),
-            "private": FakeDecider(fake_jev, store, cfg,
-                                     decider_tag="private",
-                                     model_tag="fake-private"),
-        }, fake_jev
+            "private": FakeDecider(store, cfg, decider_tag="private",
+                                   model_tag="fake-private"),
+        }, None
     key = resolve_key(hj.get("key_ref", ""))
-    return {
+    deciders = {
         "hosted_jev": HostedJevDecider(
             url=hj["url"], model=hj["model"], key=key, store=store,
             timeout_s=cfg["decider"]["timeout_s"],
             price_per_mtok_in=hj["price_per_mtok_in"],
             monthly_budget_usd=budget, reserve_usd=reserve,
             stale_after_s=stale_after_s),
-    }, None
+    }
+    # F7: the private tier joins the map only with a key and a pinned
+    # cookbook; otherwise tier-private points keep teacher mode (T-HJ7).
+    fw = cfg.get("fireworks", {})
+    fkey = resolve_key(fw.get("key_ref", ""))
+    if fkey and store is not None:
+        from ..fireworks_trainer import FireworksTrainer
+        from .session import FireworksSessionDecider
+
+        pin = FireworksTrainer(cfg, store.root / "jobs",
+                               key=fkey).pin_status()
+        if pin["status"] == "ok":
+            deciders["private"] = FireworksSessionDecider(store, cfg, fkey)
+    return deciders, None

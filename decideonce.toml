@@ -1,4 +1,4 @@
-# Default config for decideonce (spec §8). Path from DECIDEONCE_CONFIG.
+# Default config for decideonce. Path from DECIDEONCE_CONFIG.
 # Every default below is a config value: change the config, not the code.
 
 [store]
@@ -6,14 +6,12 @@ data_dir = "~/.decideonce"
 project = "default"
 max_rows_per_point = 50000
 
-[jev]
-url = "http://127.0.0.1:8090"
-timeout_s = 10
-
 [decider]
-# Default stays local_legacy until M12 (review D): set "tiered" (+ key_ref and
-# monthly_budget_usd below) for the hosted path; shadow needs training here.
-backend = "local_legacy"  # "tiered" | "local_legacy" (current probe path, until M12) | "fake"
+# "tiered" is the default: hosted Jev answers from shadow on, no training
+# step (key_ref + monthly_budget_usd below). "fake" is scripted fakes for
+# offline tries. Pre-M12 configs with backend = "local_legacy" or a [jev]
+# section are refused at startup: remove [jev]; set backend = "tiered".
+backend = "tiered"  # "tiered" | "fake"
 timeout_s = 3
 
 [hosted_jev]
@@ -26,15 +24,23 @@ fit_rows = 200
 min_private_gain = 0.05
 min_compare = 100
 redemote_window_days = 30
-pack = false  # true is refused at startup (one request per point, G7)
+pack = false  # true is refused at startup (one request per point)
 reserve_usd = 0.0005
-fake_accuracy = 0.97
+fake_accuracy = 1.0
 
 [analyze]
 min_group = 20
 weights = {R2 = 2, R3 = 2, R4_high = 2, R4_mid = 1, R5 = 1, R6 = -1, R8 = 1}
 good_fit = 6
 possible = 3
+
+[discovery]
+# Call-name suffixes the static detector treats as LLM calls.
+llm_calls = ["chat", "complete", "completions.create", "messages.create",
+             "do_decide", "invoke", "generate"]
+# Min share of runs (with a later step) whose later input/branch consumes the
+# output for a trace group to count as a behaviour candidate.
+min_consumed = 0.8
 
 [train]
 min_train = 60
@@ -54,6 +60,19 @@ smoke_examples = 32
 epochs = 2
 train_price_per_mtok = 5.86
 eval_price_per_decision = 0.0012
+# M11: the pinned cookbook runs as a child process (GP1). Empty cookbook_dir
+# disables the live trainer; set it to a clone at cookbook_commit.
+cookbook_dir = ""
+cookbook_commit = "57968a2"
+batch_rows = 24  # recipe --batch-size counts rows (GP2)
+lora_rank = 64
+learning_rate = 0.0001
+base_model = "accounts/fireworks/models/muse-glimmer-30b"  # informational: the recipe default
+job_max_hours = 3  # detached jobs past this are killed (GP2)
+worker_idle_min = 30  # scoring sessions close after this long idle (GP6)
+score_price_per_mtok = 1.96  # prefill-rate assumption, unverified until L3 (GP12)
+reserve_usd = 0.005  # per-call scoring reservation under tier fireworks (GP12)
+allow_session_serving = false  # live private shadow/serve needs this + L3 + written OK (GP11)
 
 [autopilot]
 enabled = false  # default off: v1.8 behaviour unchanged
@@ -67,7 +86,7 @@ min_new_rows = 100
 free_training_until = ""  # set only after the user checked the smoke job was not billed
 cooldown_days = 7
 check_interval_min = 10
-notify_cmd = ""  # e.g. ["hivey", "msg", "send", "human"]; run with a one-line message, no shell
+notify_cmd = ""  # e.g. ["notify-send"]; run with a one-line message appended, no shell
 
 [autopilot_trust]
 public_key = ""  # set by `decideonce autopilot keygen` (base64 Ed25519)

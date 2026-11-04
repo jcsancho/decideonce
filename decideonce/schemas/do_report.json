@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://decide-mcp/dm_report.json",
-  "title": "dm_report input (spec §2.8, §15.8)",
+  "$id": "urn:decideonce:do_report",
+  "title": "do_report input (includes the workflow report)",
   "type": "object",
   "properties": {
     "point_id": {"type": "string"},

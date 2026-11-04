@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://decide-mcp/dm_extract.json",
-  "title": "dm_extract (§15.2): call 1 submits a transcript, call 2 submits records",
+  "$id": "urn:decideonce:do_extract",
+  "title": "do_extract: call 1 submits a transcript, call 2 submits records",
   "type": "object",
   "properties": {
     "transcript": {"type": "object"},

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://decide-mcp/dm_plan_result.json",
-  "title": "dm_plan_result input (spec §15.5)",
+  "$id": "urn:decideonce:do_plan_result",
+  "title": "do_plan_result input",
   "type": "object",
   "required": ["plan_id"],
   "properties": {

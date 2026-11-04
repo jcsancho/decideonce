@@ -8,14 +8,28 @@ import functools
 import json
 import sqlite3
 import threading
-import time
 from pathlib import Path
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 17
+
+SEQ_TOP = 10 ** 18  # sort key for rows without seq (hand-built fixtures)
 
 
 def _utcnow() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def row_seq(r: dict) -> int:
+    """Monotonic insertion order of a decision/plan row (H2)."""
+    s = r.get("seq")
+    return s if isinstance(s, int) else SEQ_TOP
+
+
+def row_key(r: dict) -> tuple:
+    """Total decision-time order: seq first, ts/id break fabricated ties."""
+    return (row_seq(r), r.get("ts") or "", r.get("decision_id") or "")
 
 
 MIGRATIONS: dict[int, list[str]] = {
@@ -313,6 +327,53 @@ MIGRATIONS: dict[int, list[str]] = {
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_one_running
            ON jobs((1)) WHERE status IN ('running', 'launching')""",
     ],
+    14: [
+        # Prepublish review H2: monotonic per-DB sequence for decisions and
+        # plans, so fit/evidence/late/drift/plan splits order by insertion
+        # instead of (second-resolution ts, random id). Backfill follows
+        # rowid order, which is insertion order; new rows continue past MAX.
+        "ALTER TABLE decisions ADD COLUMN seq INTEGER",
+        "UPDATE decisions SET seq = rowid",
+        """CREATE INDEX IF NOT EXISTS idx_decisions_point_seq
+           ON decisions (point_id, seq)""",
+        "ALTER TABLE plan_records ADD COLUMN seq INTEGER",
+        "UPDATE plan_records SET seq = rowid",
+        """CREATE INDEX IF NOT EXISTS idx_plans_workflow_seq
+           ON plan_records (workflow, seq)""",
+        # The last fit row's seq (decision seq for decide fits, plan seq
+        # for plan fits). Pre-v14 fits carry NULL and resolve by stored id.
+        "ALTER TABLE hosted_fit ADD COLUMN last_fit_seq INTEGER",
+    ],
+    15: [
+        # M11 F4: the finalize tail (models + spend) completed. A done job
+        # without it crashed between mark_done and store; the recovery pass
+        # re-runs the tail. Set atomically with the spend write.
+        "ALTER TABLE jobs ADD COLUMN finalized INTEGER NOT NULL DEFAULT 0",
+    ],
+    16: [
+        # M11 F8: background evaluation. train_usd is the ledger amount
+        # for the train part (train estimate; 0.0 when the free path
+        # covers it); counted_usd is reset to it when evaluation ends so
+        # the cap counts training estimate + settled evaluation spend.
+        # eval_json carries the eval results (per-point T/metrics) from
+        # the eval thread to the finalize tail and the recovery pass.
+        "ALTER TABLE jobs ADD COLUMN train_usd REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE jobs ADD COLUMN eval_json TEXT",
+        # M11 F8 (GP7): private plan fits share the fits table, keyed by
+        # tier so they never clobber the hosted fits.
+        "ALTER TABLE hosted_fit ADD COLUMN tier TEXT NOT NULL "
+        "DEFAULT 'hosted_jev'",
+        # M11 F8: evaluating counts as running for one-job-at-a-time.
+        "DROP INDEX IF EXISTS idx_jobs_one_running",
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_one_running
+           ON jobs((1)) WHERE status IN ('running', 'launching',
+           'evaluating')""",
+    ],
+    17: [
+        # M11 F9 (§7.2 step 5): the pending checkpoint's probabilities,
+        # logged beside the serving one on retrained serve points.
+        "ALTER TABLE decisions ADD COLUMN pending_probe TEXT",
+    ],
 }
 
 
@@ -322,9 +383,7 @@ class Store:
         self.root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / "decide.db"
         self.models_dir = self.root / "models"
-        self.vectors_dir = self.root / "vectors"
         self.models_dir.mkdir(exist_ok=True)
-        self.vectors_dir.mkdir(exist_ok=True)
         # check_same_thread=False + RLock: the MCP server and gateway call from
         # worker threads; SQLite itself is in WAL mode with a busy timeout.
         self._lock = threading.RLock()
@@ -474,9 +533,11 @@ class Store:
                    audit, source, teacher_choice, extracted_choice, run_id, extraction_id,
                    extractor, decision_pos, at_start, final_choice, outcome, teacher_cost,
                    jev_seconds, unparsed, rule_violation, rule_violation_in_run, override,
-                   warnings, phase, created_at, transcript_id, hosted, decider)
+                   warnings, phase, created_at, transcript_id, hosted, decider, seq,
+                   pending_probe)
                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           (SELECT COALESCE(MAX(seq), 0) + 1 FROM decisions), ?)""",
                 (
                     row["decision_id"], row["point_id"], row["point_version"], row["ts"],
                     self._j(row.get("context")), row.get("state_text"),
@@ -495,7 +556,7 @@ class Store:
                     int(bool(row.get("override", False))), self._j(row.get("warnings")),
                     row.get("phase"), _utcnow(),
                     row.get("transcript_id"), self._j(row.get("hosted")),
-                    row.get("decider"),
+                    row.get("decider"), self._j(row.get("pending_probe")),
                 ),
             )
             self._trim(row["point_id"], max_rows_per_point)
@@ -506,7 +567,7 @@ class Store:
         self.cx.execute(
             """DELETE FROM decisions WHERE point_id=? AND decision_id NOT IN (
                  SELECT decision_id FROM decisions WHERE point_id=?
-                 ORDER BY rowid DESC LIMIT ?)""",
+                 ORDER BY seq DESC LIMIT ?)""",
             (point_id, point_id, limit),
         )
 
@@ -531,7 +592,7 @@ class Store:
         d = dict(row)
         for k in ("context", "options", "allowed_options", "rule_hits", "jev_zero_shot",
                   "probe", "outcome", "teacher_cost", "decision_pos", "warnings",
-                  "hosted"):
+                  "hosted", "pending_probe"):
             if d.get(k) is not None:
                 d[k] = json.loads(d[k])
         for k in ("audit", "unparsed", "rule_violation", "rule_violation_in_run", "override"):
@@ -610,8 +671,8 @@ class Store:
             raise
 
     def decisions_for_point(self, point_id: str, limit: int | None = None) -> list[dict]:
-        # rowid order = insertion = time order (ts has only 1 s resolution).
-        q = "SELECT * FROM decisions WHERE point_id=? ORDER BY rowid"
+        # seq order = insertion = time order (H2: ts alone is ambiguous).
+        q = "SELECT * FROM decisions WHERE point_id=? ORDER BY seq"
         args: tuple = (point_id,)
         if limit is not None:
             q += " LIMIT ?"
@@ -625,21 +686,49 @@ class Store:
 
     # -- models ----------------------------------------------------------
     def save_model(self, point_id: str, point_version: int, kind: str,
-                   path: str, card: dict) -> int:
+                   path: str, card: dict, active: bool = True) -> int:
         with self.cx:
-            self.cx.execute(
-                "UPDATE models SET active=0 WHERE point_id=? AND kind=?", (point_id, kind))
+            if active:
+                self.cx.execute(
+                    "UPDATE models SET active=0 WHERE point_id=? AND kind=?",
+                    (point_id, kind))
             cur = self.cx.execute(
                 """INSERT INTO models(point_id, point_version, kind, path, card, created_at, active)
-                   VALUES(?, ?, ?, ?, ?, ?, 1)""",
-                (point_id, point_version, kind, path, json.dumps(card), _utcnow()),
+                   VALUES(?, ?, ?, ?, ?, ?, ?)""",
+                (point_id, point_version, kind, path, json.dumps(card), _utcnow(),
+                 1 if active else 0),
             )
             return int(cur.lastrowid)
+
+    def activate_model(self, model_id: int) -> None:
+        """F9 (§7.2 step 5): switch the active private model (the pending
+        checkpoint earned serve)."""
+        with self.cx:
+            row = self.cx.execute(
+                "SELECT point_id, kind FROM models WHERE id=?",
+                (model_id,)).fetchone()
+            if row is None:
+                return
+            self.cx.execute(
+                "UPDATE models SET active=0 WHERE point_id=? AND kind=?",
+                (row["point_id"], row["kind"]))
+            self.cx.execute("UPDATE models SET active=1 WHERE id=?",
+                            (model_id,))
 
     def active_model(self, point_id: str, kind: str = "probe") -> dict | None:
         row = self.cx.execute(
             """SELECT * FROM models WHERE point_id=? AND kind=? AND active=1
                ORDER BY id DESC LIMIT 1""", (point_id, kind)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["card"] = json.loads(d["card"])
+        return d
+
+    def get_model(self, model_id: int) -> dict | None:
+        """F9: a model row by id (the pending checkpoint), or None."""
+        row = self.cx.execute(
+            "SELECT * FROM models WHERE id=?", (model_id,)).fetchone()
         if not row:
             return None
         d = dict(row)
@@ -891,8 +980,8 @@ class Store:
         self.cx.execute("BEGIN IMMEDIATE")
         try:
             row = self.cx.execute(
-                "SELECT 1 FROM jobs WHERE status IN ('running', 'launching')"
-                " LIMIT 1").fetchone()
+                "SELECT 1 FROM jobs WHERE status IN ('running', 'launching',"
+                " 'evaluating') LIMIT 1").fetchone()
             if row is not None:
                 self.cx.execute("ROLLBACK")
                 raise RuntimeError("job_running")
@@ -900,8 +989,8 @@ class Store:
                 """INSERT INTO jobs(job_id, kind, status, estimate_usd, counted_usd,
                                     spend_usd, points, autopilot, error,
                                     created_at, updated_at, idempotency_key,
-                                    status_failures, failed_at)
-                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    status_failures, failed_at, train_usd)
+                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (job["job_id"], job["kind"], job["status"],
                  float(job.get("estimate_usd", 0)), float(job.get("counted_usd", 0)),
                  float(job.get("spend_usd", 0)),
@@ -909,7 +998,8 @@ class Store:
                  1 if job.get("autopilot") else 0, job.get("error"),
                  job["created_at"], job.get("updated_at", job["created_at"]),
                  job.get("idempotency_key"),
-                 int(job.get("status_failures", 0)), job.get("failed_at")))
+                 int(job.get("status_failures", 0)), job.get("failed_at"),
+                 float(job.get("train_usd", 0))))
             self.cx.execute("COMMIT")
         except Exception:
             try:
@@ -972,14 +1062,101 @@ class Store:
         d = dict(row)
         d["points"] = json.loads(d["points"]) if d.get("points") else []
         d["autopilot"] = bool(d.get("autopilot"))
-        for k in ("estimate_usd", "counted_usd", "spend_usd"):
+        for k in ("estimate_usd", "counted_usd", "spend_usd", "train_usd"):
             d[k] = float(d.get(k) or 0)
         return d
 
     def jobs_running(self) -> list[dict]:
+        """Running + evaluating jobs (F8: one job at a time covers both)."""
         rows = self.cx.execute(
-            "SELECT * FROM jobs WHERE status='running' ORDER BY created_at").fetchall()
+            "SELECT * FROM jobs WHERE status IN ('running', 'evaluating') "
+            "ORDER BY created_at").fetchall()
         return [self._parse_job(r) for r in rows]
+
+    def jobs_evaluating(self) -> list[dict]:
+        """Jobs stuck mid-evaluation (F8 restart recovery)."""
+        rows = self.cx.execute(
+            "SELECT * FROM jobs WHERE status='evaluating' "
+            "ORDER BY created_at").fetchall()
+        return [self._parse_job(r) for r in rows]
+
+    def jobs_eval_failed(self) -> list[dict]:
+        """Jobs whose evaluation failed (F8 retry_eval)."""
+        rows = self.cx.execute(
+            "SELECT * FROM jobs WHERE status='eval_failed' "
+            "ORDER BY created_at").fetchall()
+        return [self._parse_job(r) for r in rows]
+
+    def job_begin_eval(self, job_id: str) -> bool:
+        """F8: conditional running -> evaluating (one eval thread wins)."""
+        with self.cx:
+            cur = self.cx.execute(
+                "UPDATE jobs SET status='evaluating', updated_at=? "
+                "WHERE job_id=? AND status='running'",
+                (_utcnow(), job_id))
+            return cur.rowcount == 1
+
+    def job_claim_evaluated(self, job_id: str) -> bool:
+        """F8: conditional evaluating -> done (the eval thread's G4)."""
+        with self.cx:
+            cur = self.cx.execute(
+                "UPDATE jobs SET status='done', updated_at=? "
+                "WHERE job_id=? AND status='evaluating'",
+                (_utcnow(), job_id))
+            return cur.rowcount == 1
+
+    def job_retry_eval(self, job_id: str) -> bool:
+        """F8: conditional eval_failed -> evaluating (retry_eval)."""
+        with self.cx:
+            cur = self.cx.execute(
+                "UPDATE jobs SET status='evaluating', error=NULL, "
+                "eval_json=NULL, updated_at=? "
+                "WHERE job_id=? AND status='eval_failed'",
+                (_utcnow(), job_id))
+            return cur.rowcount == 1
+
+    def job_save_eval(self, job_id: str, eval_doc: dict) -> None:
+        """F8: persist eval results for the tail and the recovery pass."""
+        with self.cx:
+            self.cx.execute(
+                "UPDATE jobs SET eval_json=?, updated_at=? WHERE job_id=?",
+                (json.dumps(eval_doc), _utcnow(), job_id))
+
+    def job_get_eval(self, job_id: str) -> dict | None:
+        """F8: the persisted eval results, or None when absent."""
+        row = self.cx.execute(
+            "SELECT eval_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
+        if not row or not row["eval_json"]:
+            return None
+        try:
+            return json.loads(row["eval_json"])
+        except ValueError:
+            return None
+
+    def jobs_done_unfinalized(self) -> list[dict]:
+        """M11 F4: done/smoke_done jobs whose tail never completed (crash
+        between mark_done and store). Recovery re-runs their tails."""
+        rows = self.cx.execute(
+            "SELECT * FROM jobs WHERE status IN ('done', 'smoke_done') "
+            "AND COALESCE(finalized, 0)=0 ORDER BY created_at").fetchall()
+        return [self._parse_job(r) for r in rows]
+
+    def job_record_spend_finalized(self, job_id: str, counted: float,
+                                   month: str) -> bool:
+        """M11 F4: settle spend and set finalized=1 atomically. Only the
+        first call wins (concurrent recovery is safe)."""
+        with self.cx:
+            cur = self.cx.execute(
+                "UPDATE jobs SET spend_usd=?, finalized=1, updated_at=? "
+                "WHERE job_id=? AND COALESCE(finalized, 0)=0",
+                (float(counted), _utcnow(), job_id))
+            if cur.rowcount != 1:
+                return False
+            self.cx.execute(
+                "INSERT INTO spend(month, tier, usd, calls) VALUES(?, ?, ?, 1)"
+                " ON CONFLICT(month, tier) DO UPDATE SET usd=usd+excluded.usd,"
+                " calls=calls+1", (month, "fireworks", float(counted)))
+            return True
 
     def jobs_latest(self) -> dict | None:
         row = self.cx.execute(
@@ -1002,22 +1179,26 @@ class Store:
 
     # -- hosted fits (build §7) --------------------------------------------
     def save_hosted_fit(self, fit: dict) -> int:
+        tier = fit.get("tier", "hosted_jev")
         with self.cx:
             self.cx.execute(
-                "UPDATE hosted_fit SET active=0 WHERE point_id=? AND kind=?",
-                (fit["point_id"], fit["kind"]))
+                "UPDATE hosted_fit SET active=0 WHERE point_id=? AND kind=? "
+                "AND tier=?",
+                (fit["point_id"], fit["kind"], tier))
             cur = self.cx.execute(
                 """INSERT INTO hosted_fit(point_id, point_version, kind,
-                   epoch_start_ts, fitted_at, n_fit, last_fit_ts,
-                   last_fit_decision_id, temperature, temperature_skipped,
-                   threshold, coverage, error_at_threshold, fit_agreement,
-                   teacher_only_options, per_option, fit_ids,
+                   tier, epoch_start_ts, fitted_at, n_fit, last_fit_ts,
+                   last_fit_decision_id, last_fit_seq, temperature,
+                   temperature_skipped, threshold, coverage, error_at_threshold,
+                   fit_agreement, teacher_only_options, per_option, fit_ids,
                    fit_label_kinds, active)
                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, 1)""",
+                   ?, ?, ?, 1)""",
                 (fit["point_id"], fit["point_version"], fit["kind"],
+                 fit.get("tier", "hosted_jev"),
                  fit["epoch_start_ts"], fit["fitted_at"], fit["n_fit"],
                  fit["last_fit_ts"], fit["last_fit_decision_id"],
+                 fit.get("last_fit_seq"),
                  fit["temperature"], fit.get("temperature_skipped"),
                  fit.get("threshold"), fit.get("coverage"),
                  fit.get("error_at_threshold"), fit.get("fit_agreement"),
@@ -1037,31 +1218,35 @@ class Store:
         """
         self.cx.execute("BEGIN IMMEDIATE")
         try:
+            tier = fit.get("tier", "hosted_jev")
             row = self.cx.execute(
                 """SELECT * FROM hosted_fit
-                   WHERE point_id=? AND kind=? AND active=1
+                   WHERE point_id=? AND kind=? AND tier=? AND active=1
                    ORDER BY id DESC LIMIT 1""",
-                (fit["point_id"], fit["kind"])).fetchone()
+                (fit["point_id"], fit["kind"], tier)).fetchone()
             if row is not None:
                 existing = self._parse_fit(row)
                 if existing.get("point_version") == fit.get("point_version"):
                     self.cx.execute("ROLLBACK")
                     return existing
             self.cx.execute(
-                "UPDATE hosted_fit SET active=0 WHERE point_id=? AND kind=?",
-                (fit["point_id"], fit["kind"]))
+                "UPDATE hosted_fit SET active=0 WHERE point_id=? AND kind=? "
+                "AND tier=?",
+                (fit["point_id"], fit["kind"], tier))
             self.cx.execute(
                 """INSERT INTO hosted_fit(point_id, point_version, kind,
-                   epoch_start_ts, fitted_at, n_fit, last_fit_ts,
-                   last_fit_decision_id, temperature, temperature_skipped,
-                   threshold, coverage, error_at_threshold, fit_agreement,
-                   teacher_only_options, per_option, fit_ids,
+                   tier, epoch_start_ts, fitted_at, n_fit, last_fit_ts,
+                   last_fit_decision_id, last_fit_seq, temperature,
+                   temperature_skipped, threshold, coverage, error_at_threshold,
+                   fit_agreement, teacher_only_options, per_option, fit_ids,
                    fit_label_kinds, active)
                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   ?, 1)""",
+                   ?, ?, ?, 1)""",
                 (fit["point_id"], fit["point_version"], fit["kind"],
+                 fit.get("tier", "hosted_jev"),
                  fit["epoch_start_ts"], fit["fitted_at"], fit["n_fit"],
                  fit["last_fit_ts"], fit["last_fit_decision_id"],
+                 fit.get("last_fit_seq"),
                  fit["temperature"], fit.get("temperature_skipped"),
                  fit.get("threshold"), fit.get("coverage"),
                  fit.get("error_at_threshold"), fit.get("fit_agreement"),
@@ -1076,7 +1261,8 @@ class Store:
             except Exception:
                 pass
             raise
-        out = self.active_hosted_fit(fit["point_id"], fit["kind"])
+        out = self.active_hosted_fit(fit["point_id"], fit["kind"],
+                                       fit.get("tier", "hosted_jev"))
         assert out is not None
         return out
 
@@ -1094,23 +1280,32 @@ class Store:
         return d
 
     def active_hosted_fit(self, point_id: str,
-                          kind: str = "decide") -> dict | None:
+                          kind: str = "decide",
+                          tier: str = "hosted_jev") -> dict | None:
         row = self.cx.execute(
-            """SELECT * FROM hosted_fit WHERE point_id=? AND kind=? AND active=1
-               ORDER BY id DESC LIMIT 1""", (point_id, kind)).fetchone()
+            """SELECT * FROM hosted_fit WHERE point_id=? AND kind=? AND tier=?
+               AND active=1
+               ORDER BY id DESC LIMIT 1""",
+            (point_id, kind, tier)).fetchone()
         return self._parse_fit(row) if row else None
 
     def deactivate_hosted_fit(self, point_id: str,
-                              kind: str | None = None) -> None:
+                              kind: str | None = None,
+                              tier: str | None = None) -> None:
         with self.cx:
-            if kind is None:
+            if kind is None and tier is None:
                 self.cx.execute(
                     "UPDATE hosted_fit SET active=0 WHERE point_id=?",
                     (point_id,))
-            else:
+            elif tier is None:
                 self.cx.execute(
                     "UPDATE hosted_fit SET active=0 WHERE point_id=? AND kind=?",
                     (point_id, kind))
+            else:
+                self.cx.execute(
+                    "UPDATE hosted_fit SET active=0 WHERE point_id=? AND kind=? "
+                    "AND tier=?",
+                    (point_id, kind, tier))
 
     def purge_unregistered_traces(self, older_than_ts: str) -> int:
         with self.cx:
@@ -1324,9 +1519,10 @@ class Store:
                    context, context_source, run_model, cheap_model, recommendation,
                    model, addendum, points, would_have, audit, trial_id, pair_id, arm,
                    pilot_forced, cost, check_result, conflicts, followed_rate,
-                   followed_n, point_versions, final_output)
+                   followed_n, point_versions, final_output, seq)
                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?)
+                           ?, ?, ?, ?, ?, ?,
+                           (SELECT COALESCE(MAX(seq), 0) + 1 FROM plan_records))
                    ON CONFLICT(plan_id) DO UPDATE SET cost=excluded.cost,
                      check_result=excluded.check_result, conflicts=excluded.conflicts,
                      followed_rate=excluded.followed_rate,
@@ -1360,7 +1556,7 @@ class Store:
 
     def plans_for_workflow(self, workflow: str) -> list[dict]:
         return [self._parse_plan(r) for r in self.cx.execute(
-            "SELECT * FROM plan_records WHERE workflow=? ORDER BY ts, plan_id",
+            "SELECT * FROM plan_records WHERE workflow=? ORDER BY seq",
             (workflow,))]
 
     def plans_for_transcript_link(self, transcript_id: str) -> list[dict]:

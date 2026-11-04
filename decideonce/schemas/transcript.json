@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://decide-mcp/transcript.json",
-  "title": "transcript (§15.1)",
+  "$id": "urn:decideonce:transcript",
+  "title": "transcript",
   "type": "object",
   "required": ["run_id", "workflow", "model", "input", "events", "final_output"],
   "properties": {

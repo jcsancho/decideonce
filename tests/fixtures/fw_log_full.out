@@ -1,0 +1,99 @@
+/path/to/cookbook/training/.venv/lib/python3.14/site-packages/fireworks/training/sdk/_core/_compat.py:46: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.typing import (
+2026-11-02 10:03:09,148 INFO ServiceClient initialized for session ts-test…
+2026-11-02 10:03:25,240 INFO Created model run-test…:train:0 (lora_rank=64)
+2026-11-02 10:03:25,715 INFO Auto-resolved account ID: acct-test
+2026-11-02 10:03:25,715 INFO FiretitanTrainingClient session_id: f95e210f
+2026-11-02 10:03:26,198 INFO Auto-resolved account ID: acct-test
+2026-11-02 10:03:26,198 INFO Serverless training session ts-test…, run run-test…. To continue from one of this run's checkpoints in a new process, pass init_from_checkpoint='acct-test/run-test…/<checkpoint>' with the same log_path.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-11-02 10:03:26,411 WARNING Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+2026-11-02 10:03:28,376 INFO Auto-selected 4 render workers: cpu=15 (quota=0 affinity=0 host=15) max=16 tasks=150 cgroup=0.0/0.0 GiB host_available=0.0/0.0 GiB base=8.0 GiB reserve=8.0 GiB per_worker=10.0 GiB
+2026-11-02 10:03:29,766 INFO Starting at step 0 from base model (no checkpoint)
+2026-11-02 10:05:29,676 INFO [Eval] step 0 | K-way NLL 0.9780 | accuracy 0.7667
+{"type": "metrics", "step": 0, "eval_loss": 0.9779605923542674, "eval_accuracy": 0.7666666666666667}
+/path/to/cookbook/training/.venv/lib/python3.14/site-packages/fireworks/training/sdk/_core/_compat.py:46: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.typing import (
+/path/to/cookbook/training/.venv/lib/python3.14/site-packages/fireworks/training/sdk/_core/_compat.py:46: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.typing import (
+/path/to/cookbook/training/.venv/lib/python3.14/site-packages/fireworks/training/sdk/_core/_compat.py:46: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.typing import (
+/path/to/cookbook/training/.venv/lib/python3.14/site-packages/fireworks/training/sdk/_core/_compat.py:46: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.typing import (
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+{"type": "metrics", "step": 1, "kway_loss": 1.2714383204778035, "lr": 0.0001}
+{"type": "metrics", "step": 2, "kway_loss": 0.7183481057484945, "lr": 0.0001}
+{"type": "metrics", "step": 3, "kway_loss": 0.7122652530670166, "lr": 0.0001}
+{"type": "metrics", "step": 4, "kway_loss": 0.6818968454996744, "lr": 0.0001}
+{"type": "metrics", "step": 5, "kway_loss": 0.45465087890625, "lr": 0.0001}
+{"type": "metrics", "step": 6, "kway_loss": 0.5370642344156901, "lr": 0.0001}
+{"type": "metrics", "step": 7, "kway_loss": 0.3110462824503581, "lr": 0.0001}
+{"type": "metrics", "step": 8, "kway_loss": 0.5503764947255453, "lr": 0.0001}
+{"type": "metrics", "step": 9, "kway_loss": 0.5497131745020548, "lr": 0.0001}
+{"type": "metrics", "step": 10, "kway_loss": 0.19157369931538895, "lr": 0.0001}
+{"type": "metrics", "step": 11, "kway_loss": 0.4289396603902181, "lr": 0.0001}
+{"type": "metrics", "step": 12, "kway_loss": 0.22701160113016763, "lr": 0.0001}
+{"type": "metrics", "step": 13, "kway_loss": 0.14921911557515463, "lr": 0.0001}
+{"type": "metrics", "step": 14, "kway_loss": 0.1733839511871338, "lr": 0.0001}
+{"type": "metrics", "step": 15, "kway_loss": 0.2946337064107259, "lr": 0.0001}
+{"type": "metrics", "step": 16, "kway_loss": 0.05804729461669922, "lr": 0.0001}
+{"type": "metrics", "step": 17, "kway_loss": 0.23775529861450195, "lr": 0.0001}
+{"type": "metrics", "step": 18, "kway_loss": 0.20039033889770508, "lr": 0.0001}
+{"type": "metrics", "step": 19, "kway_loss": 0.10950724283854167, "lr": 0.0001}
+2026-11-02 10:22:08,936 INFO [Eval] step 19 | K-way NLL 0.2264 | accuracy 0.9333
+{"type": "metrics", "step": 19, "eval_loss": 0.22639392327616936, "eval_accuracy": 0.9333333333333333}
+{"type": "metrics", "step": 20, "kway_loss": 0.18686064084370932, "lr": 0.0001}
+{"type": "metrics", "step": 21, "kway_loss": 0.11413129170735677, "lr": 0.0001}
+{"type": "metrics", "step": 22, "kway_loss": 0.13499267896016437, "lr": 0.0001}
+{"type": "metrics", "step": 23, "kway_loss": 0.12763524055480954, "lr": 0.0001}
+{"type": "metrics", "step": 24, "kway_loss": 0.06159043312072754, "lr": 0.0001}
+{"type": "metrics", "step": 25, "kway_loss": 0.0028613408406575522, "lr": 0.0001}
+{"type": "metrics", "step": 26, "kway_loss": 0.057302157084147126, "lr": 0.0001}
+{"type": "metrics", "step": 27, "kway_loss": 0.00829788049062093, "lr": 0.0001}
+{"type": "metrics", "step": 28, "kway_loss": 0.4177536567052205, "lr": 0.0001}
+{"type": "metrics", "step": 29, "kway_loss": 0.9813615083694458, "lr": 0.0001}
+{"type": "metrics", "step": 30, "kway_loss": 0.31383411089579266, "lr": 0.0001}
+{"type": "metrics", "step": 31, "kway_loss": 0.24341352780659994, "lr": 0.0001}
+{"type": "metrics", "step": 32, "kway_loss": 0.20559644699096677, "lr": 0.0001}
+{"type": "metrics", "step": 33, "kway_loss": 0.3027152220408122, "lr": 0.0001}
+{"type": "metrics", "step": 34, "kway_loss": 0.1451292037963867, "lr": 0.0001}
+{"type": "metrics", "step": 35, "kway_loss": 0.551170825958252, "lr": 0.0001}
+{"type": "metrics", "step": 36, "kway_loss": 0.06296165784200032, "lr": 0.0001}
+{"type": "metrics", "step": 37, "kway_loss": 0.041626453399658196, "lr": 0.0001}
+{"type": "metrics", "step": 38, "kway_loss": 0.11583232879638672, "lr": 0.0001}
+2026-11-02 10:41:19,130 INFO [Eval] step 38 | K-way NLL 0.2113 | accuracy 0.9200
+{"type": "metrics", "step": 38, "eval_loss": 0.2113120332158379, "eval_accuracy": 0.92}
+{"type": "metrics", "step": 39, "kway_loss": 0.16363970438639322, "lr": 0.0001}
+{"type": "metrics", "step": 40, "kway_loss": 0.20220526059468588, "lr": 0.0001}
+{"type": "metrics", "step": 41, "kway_loss": 0.0767201582590739, "lr": 0.0001}
+{"type": "metrics", "step": 42, "kway_loss": 0.1596535841623942, "lr": 0.0001}
+{"type": "metrics", "step": 43, "kway_loss": 0.011165857315063477, "lr": 0.0001}
+{"type": "metrics", "step": 44, "kway_loss": 0.29397169748942054, "lr": 0.0001}
+{"type": "metrics", "step": 45, "kway_loss": 0.14707152048746744, "lr": 0.0001}
+{"type": "metrics", "step": 46, "kway_loss": 0.014389276504516602, "lr": 0.0001}
+{"type": "metrics", "step": 47, "kway_loss": 0.1668549378712972, "lr": 0.0001}
+{"type": "metrics", "step": 48, "kway_loss": 0.15180524190266925, "lr": 0.0001}
+{"type": "metrics", "step": 49, "kway_loss": 0.09337751070658364, "lr": 0.0001}
+{"type": "metrics", "step": 50, "kway_loss": 0.027433872222900387, "lr": 0.0001}
+{"type": "metrics", "step": 51, "kway_loss": 0.3660316864649455, "lr": 0.0001}
+{"type": "metrics", "step": 52, "kway_loss": 0.04806224505106608, "lr": 0.0001}
+{"type": "metrics", "step": 53, "kway_loss": 0.37889190514882404, "lr": 0.0001}
+{"type": "metrics", "step": 54, "kway_loss": 0.15394965807596842, "lr": 0.0001}
+{"type": "metrics", "step": 55, "kway_loss": 0.22658308347066244, "lr": 0.0001}
+{"type": "metrics", "step": 56, "kway_loss": 0.1321609020233154, "lr": 0.0001}
+{"type": "metrics", "step": 57, "kway_loss": 0.1259018580118815, "lr": 0.0001}
+2026-11-02 10:59:24,653 INFO [Eval] step 57 | K-way NLL 0.1828 | accuracy 0.9400
+{"type": "metrics", "step": 57, "eval_loss": 0.1828320544829906, "eval_accuracy": 0.94}
+2026-11-02 10:59:24,655 INFO Saving DCP checkpoint 'step-57'...
+2026-11-02 11:00:13,095 INFO DCP checkpoint 'step-57' saved (48.4s)
+2026-11-02 11:02:06,292 INFO Decision calibration: T={'choice': 0.7943445437494694}
+2026-11-02 11:02:07,748 INFO Saving sampler checkpoint 'step-57-cal'...
+2026-11-02 11:02:31,301 INFO Sampler checkpoint 'step-57-cal' saved (23.6s)
+2026-11-02 11:02:32,769 INFO Sampler server-stored name 'run-test…-step-57-cal-f95e210f' differs from caller name 'step-57-cal'; using control-plane row for subsequent promotion.
+2026-11-02 11:02:33,877 INFO Promoting newest promotable checkpoint: run-test…-step-57-cal-f95e210f -> refund-decide-v1
+2026-11-02 11:02:33,877 INFO Promoting session checkpoint 'accounts/acct-test/trainingSessions/ts-test…/checkpoints/run-test…-step-57-cal-f95e210f' -> model 'accounts/acct-test/models/refund-decide-v1'
+2026-11-02 11:02:59,572 INFO Promoted! Model state=READY, kind=HF_PEFT_ADDON
+2026-11-02 11:02:59,572 INFO PEFT: base=accounts/fireworks/models/muse-glimmer-30b, r=64, targets=['down_proj', 'gate_proj', 'k_proj', 'o_proj', 'q_proj', 'up_proj', 'v_proj']

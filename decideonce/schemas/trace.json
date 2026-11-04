@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:decideonce:trace",
+  "title": "do_analyze trace call: one LLM call with optional run_id/after",
+  "type": "object",
+  "required": ["output"],
+  "properties": {
+    "call_id": {"type": "string"},
+    "run_id": {"type": ["string", "null"]},
+    "ts": {"type": "string"},
+    "workflow": {"type": ["string", "null"]},
+    "step": {"type": ["string", "null"]},
+    "callsite": {"type": ["string", "null"]},
+    "prompt": {"type": "string"},
+    "output": {},
+    "tokens_in": {"type": ["number", "null"]},
+    "tokens_out": {"type": ["number", "null"]},
+    "usd": {"type": ["number", "null"]},
+    "after": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["step", "input"],
+        "properties": {
+          "step": {"type": "string"},
+          "input": {}
+        },
+        "additionalProperties": false
+      }
+    },
+    "state": {"type": ["object", "null"]}
+  },
+  "additionalProperties": true
+}

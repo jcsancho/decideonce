@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://decide-mcp/dm_record.json",
-  "title": "dm_record input (spec §2.4)",
+  "$id": "urn:decideonce:do_record",
+  "title": "do_record input",
   "type": "object",
   "required": ["decision_id", "choice"],
   "properties": {

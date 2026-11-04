@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://decide-mcp/dm_decide.json",
-  "title": "dm_decide input (spec §2.3)",
+  "$id": "urn:decideonce:do_decide",
+  "title": "do_decide input",
   "type": "object",
   "required": ["point_id", "context"],
   "properties": {

@@ -2,16 +2,13 @@
 from __future__ import annotations
 
 import copy
-import ipaddress
 import os
 import tomllib
-import urllib.parse
 from pathlib import Path
 
 DEFAULTS: dict = {
     "store": {"data_dir": "~/.decideonce", "project": "default", "max_rows_per_point": 50000},
-    "jev": {"url": "http://127.0.0.1:8090", "timeout_s": 10},
-    "decider": {"backend": "local_legacy", "timeout_s": 3},
+    "decider": {"backend": "tiered", "timeout_s": 3},
     "hosted_jev": {
         "url": "https://openrouter.ai/api/v1/systemone",
         "model": "typesafe/jev-1.13",
@@ -24,7 +21,7 @@ DEFAULTS: dict = {
         "redemote_window_days": 30,
         "pack": False,
         "reserve_usd": 0.0005,
-        "fake_accuracy": 0.97,
+        "fake_accuracy": 1.0,
     },
     "analyze": {
         "min_group": 20,
@@ -50,6 +47,18 @@ DEFAULTS: dict = {
         "epochs": 2,
         "train_price_per_mtok": 5.86,
         "eval_price_per_decision": 0.0012,
+        "cookbook_dir": "",
+        "cookbook_commit": "57968a2",
+        "batch_rows": 24,
+        "lora_rank": 64,
+        "learning_rate": 1e-4,
+        "base_model": "accounts/fireworks/models/muse-glimmer-30b",
+        "job_max_hours": 3,
+        "worker_idle_min": 30,
+        "eval_ready_s": 600,
+        "score_price_per_mtok": 1.96,
+        "reserve_usd": 0.005,
+        "allow_session_serving": False,
     },
     "autopilot": {
         "enabled": False,
@@ -123,6 +132,11 @@ DEFAULTS: dict = {
         "allow_pilot_force": False,
         "check_timeout_s": 30,
     },
+    "discovery": {
+        "llm_calls": ["chat", "complete", "completions.create",
+                      "messages.create", "do_decide", "invoke", "generate"],
+        "min_consumed": 0.8,
+    },
 }
 
 
@@ -169,17 +183,55 @@ def resolve_config_path(path: str | os.PathLike | None = None) -> Path:
     return Path("decideonce.toml")
 
 
+def _check_overlay_keys(overlay: dict) -> None:
+    """Reject unknown sections and keys (two levels; nested tables unchecked)."""
+    for section, values in overlay.items():
+        if section not in DEFAULTS:
+            raise ConfigError("unknown_config_key",
+                              f"unknown config section [{section}]")
+        if not isinstance(values, dict):
+            raise ConfigError("unknown_config_key",
+                              f"config section [{section}] must be a table")
+        for key in values:
+            if key not in DEFAULTS[section]:
+                raise ConfigError("unknown_config_key",
+                                  f"unknown config key [{section}] {key!r}")
+
+
+def _check_discovery(cfg: dict) -> None:
+    """Validate the effective [discovery] values (defaults or file overlay)."""
+    disc = cfg.get("discovery", {})
+    calls = disc.get("llm_calls")
+    if (not isinstance(calls, list) or not calls
+            or any(not isinstance(c, str) or not c for c in calls)):
+        raise ConfigError("bad_discovery_config",
+                          "[discovery] llm_calls must be a non-empty list of strings")
+    mc = disc.get("min_consumed")
+    if isinstance(mc, bool) or not isinstance(mc, (int, float)) \
+            or not 0 <= mc <= 1:
+        raise ConfigError("bad_discovery_config",
+                          "[discovery] min_consumed must be a number in 0-1")
+
+
 def load_config(path: str | os.PathLike | None = None) -> dict:
     """Load config: DEFAULTS <- TOML file <- env. Missing file is fine (defaults)."""
     cfg = copy.deepcopy(DEFAULTS)
     cfg_path = resolve_config_path(path)
     if cfg_path.is_file():
         with open(cfg_path, "rb") as f:
-            cfg = _deep_merge(cfg, tomllib.load(f))
+            overlay = tomllib.load(f)
+        # M12 P1: the local probe is gone; refuse pre-M12 configs loudly.
+        if "jev" in overlay or (isinstance(overlay.get("decider"), dict)
+                               and overlay["decider"].get("backend") == "local_legacy"):
+            raise ConfigError("config_v16_migration",
+                              'remove [jev]; set [decider] backend = "tiered"')
+        _check_overlay_keys(overlay)
+        cfg = _deep_merge(cfg, overlay)
     elif "DECIDEONCE_CONFIG" in os.environ or "DECIDE_MCP_CONFIG" in os.environ \
             or path is not None:
         # Explicit path that does not exist: fail loudly, not silently default.
         raise ConfigError("config_not_found", f"config file not found: {cfg_path}")
+    _check_discovery(cfg)
     if os.environ.get("DECIDEONCE_PROJECT"):
         cfg["store"]["project"] = os.environ["DECIDEONCE_PROJECT"]
     elif os.environ.get("DECIDE_MCP_PROJECT"):
@@ -210,15 +262,3 @@ def data_root(cfg: dict) -> Path:
         pass
     return root
 
-
-def check_jev_local(url: str) -> None:
-    """Refuse to start unless jev.url resolves to loopback (§7.3)."""
-    host = urllib.parse.urlparse(url).hostname or ""
-    if host in ("localhost",):
-        return
-    try:
-        if ipaddress.ip_address(host).is_loopback:
-            return
-    except ValueError:
-        pass
-    raise ConfigError("jev_not_local", f"jev.url must be local (127.0.0.1/localhost), got {url!r}")

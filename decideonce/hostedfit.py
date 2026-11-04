@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import math
 
-from . import probe as P
+from . import stats as S
 
 TEMP_LO, TEMP_HI = 0.5, 5.0
+PRIVATE_TEMP_LO, PRIVATE_TEMP_HI = 0.05, 10.0
 PROB_FLOOR = 1e-9
 
 
@@ -27,7 +28,7 @@ def temper_full(probs: dict[str, float], T: float) -> dict[str, float]:
 def mask_temper(raw: dict[str, float], allowed: list[str],
                 T: float) -> dict[str, float]:
     """Allowed-option renormalisation, then temperature (build §7)."""
-    masked = P.mask_and_renorm(raw, allowed)
+    masked = S.mask_and_renorm(raw, allowed)
     return temper_full(masked, T)
 
 
@@ -44,7 +45,7 @@ def fit_temperature(items: list[tuple[dict, list, str]]
                     ) -> tuple[float, str | None]:
     """Golden-section search on [0.5, 5] (G8); T = 1 with fewer than 5 errors."""
     errs = sum(1 for masked, allowed, label in items
-               if P.argmax(masked, allowed) != label)
+               if S.argmax(masked, allowed) != label)
     if errs < 5:
         return 1.0, "too_few_errors"
     lo, hi = TEMP_LO, TEMP_HI
@@ -60,6 +61,46 @@ def fit_temperature(items: list[tuple[dict, list, str]]
             lo, c, fc = c, d, fd
             d = lo + gr * (hi - lo)
             fd = nll_at(items, d)
+    return (lo + hi) / 2.0, None
+
+
+def nll_at_logits(items: list[tuple[list[float], int]], T: float) -> float:
+    """Mean NLL of the label index under softmax(logits / T)."""
+    total = 0.0
+    for logits, y in items:
+        p = S.softmax([v / T for v in logits])[y]
+        total += -math.log(max(p, PROB_FLOOR))
+    return total / len(items)
+
+
+def fit_temperature_private(items: list[tuple[list[float], int]],
+                            recipe_T: float) -> tuple[float, str | None]:
+    """GP4: golden-section search on [0.05, 10] minimising label NLL over
+    worker logprobs; the recipe T with fewer than 5 errors (argmax is
+    T-invariant, so the error count is unambiguous)."""
+    errs = sum(1 for logits, y in items
+               if max(range(len(logits)), key=logits.__getitem__) != y)
+    if errs < 5 or not items:
+        try:
+            rt = float(recipe_T)
+        except (TypeError, ValueError, OverflowError):
+            return 1.0, "too_few_errors"
+        if not math.isfinite(rt) or rt <= 0:
+            return 1.0, "too_few_errors"
+        return rt, "too_few_errors"
+    lo, hi = PRIVATE_TEMP_LO, PRIVATE_TEMP_HI
+    gr = (math.sqrt(5.0) - 1.0) / 2.0
+    c, d = hi - gr * (hi - lo), lo + gr * (hi - lo)
+    fc, fd = nll_at_logits(items, c), nll_at_logits(items, d)
+    for _ in range(80):
+        if fc < fd:
+            hi, d, fd = d, c, fc
+            c = hi - gr * (hi - lo)
+            fc = nll_at_logits(items, c)
+        else:
+            lo, c, fc = c, d, fd
+            d = lo + gr * (hi - lo)
+            fd = nll_at_logits(items, d)
     return (lo + hi) / 2.0, None
 
 

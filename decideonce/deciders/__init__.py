@@ -1,34 +1,39 @@
 """Deciders package: the Decider interface and its backends (build §2)."""
+import sys
+
 from .base import DecideRequest, DecideResult, Decider, DeciderError
 from .fake import FakeDecider
-from .local import LocalProbeDecider
 
 __all__ = ["DecideRequest", "DecideResult", "Decider", "DeciderError",
-           "FakeDecider", "LocalProbeDecider", "build_deciders"]
+           "FakeDecider", "build_deciders"]
+
+_WARNED: set[str] = set()
+
+
+def _warn_fake(reason: str) -> None:
+    """Loud once-per-process stderr warning for scripted backends (H3)."""
+    if reason in _WARNED:
+        return
+    _WARNED.add(reason)
+    print(f"decideonce: FAKE decider ({reason}): scripted answers, "
+          "not a real model. Never use in production.", file=sys.stderr)
 
 
 def build_deciders(cfg: dict, store):
-    """(deciders map, raw JevBackend|None) from [decider] backend (build §2).
+    """(deciders map, None) from [decider] backend (build §2).
 
-    local_legacy -> {"legacy": LocalProbeDecider|FakeDecider} + the raw
-    backend (train keeps receiving it). tiered/fake land in H2.
+    fake -> hosted fake + standalone FakeDecider as "private".
+    tiered -> hosted only. (M12 P3 deleted the local_legacy branch with
+    the probe; pre-M12 configs are refused at load.)
     """
     from ..config import ConfigError
-    from ..jev import FakeJev, HttpJev
-    from ..config import check_jev_local
 
-    backend = cfg.get("decider", {}).get("backend", "local_legacy")
-    if backend == "local_legacy":
-        url = cfg["jev"]["url"]
-        if url.startswith("fake:"):
-            jev = FakeJev(down=url == "fake:down")
-            return {"legacy": FakeDecider(jev, store, cfg)}, jev
-        check_jev_local(url)  # raises ConfigError(jev_not_local)
-        jev = HttpJev(url, cfg["jev"]["timeout_s"])
-        return {"legacy": LocalProbeDecider(jev, store, cfg)}, jev
+    backend = cfg.get("decider", {}).get("backend", "tiered")
     if backend in ("tiered", "fake"):
-        from .hosted import build_hosted_deciders  # noqa: lazy, H2
+        if backend == "fake":
+            _warn_fake('[decider] backend = "fake"')
+        from .hosted import build_hosted_deciders
 
         return build_hosted_deciders(cfg, store)
     raise ConfigError("bad_decider_backend",
-                      f"[decider] backend must be tiered|local_legacy|fake, got {backend!r}")
+                      f"[decider] backend must be tiered|fake, got {backend!r}")
