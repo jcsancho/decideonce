@@ -1,5 +1,6 @@
 """M4 tests: serve mode, audits, drift, promotion (T-P*)."""
 import random
+import time
 import uuid
 
 import pytest
@@ -91,6 +92,9 @@ def _c_row(store, pid, i, hosted_top, hosted_conf, private_top,
     other_h = "b" if hosted_top == "a" else "a"
     other_p = "b" if private_top == "a" else "a"
     did = uuid.uuid4().hex
+    m = store.active_model(pid, "private")
+    ref = (m.get("card", {}) or {}).get("model_ref", "fake-private") \
+        if m else "fake-private"
     store.insert_decision({
         "decision_id": did, "point_id": pid, "point_version": 1,
         "ts": f"2027-01-01T00:{i:02d}:00Z",
@@ -100,7 +104,7 @@ def _c_row(store, pid, i, hosted_top, hosted_conf, private_top,
                    "probabilities": {hosted_top: hosted_conf,
                                      other_h: round(1 - hosted_conf, 2)},
                    "cost_usd": 0.0, "seconds": 0.01},
-        "probe": {"model_version": "fake-private",
+        "probe": {"model_version": ref,
                   "probabilities": {private_top: private_conf,
                                     other_p: round(1 - private_conf, 2)}},
         "mode": "teacher", "source": "do_decide", "phase": phase},
@@ -225,6 +229,90 @@ def test_T_P2_criterion_evidence(tmp_path):
     assert "evidence" in r["failed"]  # Wilson upper(3, 12) above 0.3
 
 
+def test_Z2_comparison_pins_active_model(tmp_path):
+    svc, store = _dual_ready(tmp_path)
+    _perfect_c(svc, store, "p.serve", 12)
+    assert svc._private_comparison(store.get_point("p.serve"))["n"] == 12
+    # Retrain: the new card names a new checkpoint; the old rows drop out.
+    r = svc.do_train({"point_id": "p.serve", "force": True, "confirm": True,
+                      "training_free_confirmed": True})
+    assert r["ok"] and r["status"] == "running" and r["kind"] == "full", r
+    svc.trainer.complete(r["job_id"])
+    r = svc.do_train({"point_id": "p.serve", "force": True, "confirm": True})
+    assert r["ok"] and r["status"] == "done", r
+    assert svc._private_comparison(store.get_point("p.serve"))["n"] == 0
+    _perfect_c(svc, store, "p.serve", 12, offset=12)
+    assert svc._private_comparison(store.get_point("p.serve"))["n"] == 12
+
+
+def test_Z2_drift_ignores_other_model_rows(tmp_path):
+    svc, store = make_service(tmp_path)
+    assert svc.do_register(hint_point(private_model_only=True,
+                                      target_error=0.02))["ok"]
+    store.save_model("p.serve", 1, "private", "v1-1.json",
+                     {"model_ref": "fake-private", "threshold": 0.5,
+                      "job_id": "j0"})
+    _clear_epoch(store, "p.serve")
+    flip_phase(store, "p.serve", "serve")
+    for i in range(100):  # all wrong, but a foreign checkpoint's rows
+        did = uuid.uuid4().hex
+        store.insert_decision({
+            "decision_id": did, "point_id": "p.serve", "point_version": 1,
+            "ts": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z",
+            "context": {"label_hint": "a"}, "options": ["a", "b"],
+            "allowed_options": ["a", "b"],
+            "probe": {"model_version": "other-checkpoint",
+                      "probabilities": {"a": 0.1, "b": 0.9}},
+            "mode": "teacher", "audit": True, "source": "do_decide",
+            "phase": "serve"},
+            100000)
+        assert svc.do_record({"decision_id": did, "choice": "a"})["ok"]
+    assert store.get_point("p.serve")["phase"] == "serve"
+
+
+def test_Z5_private_repeated_drift_retrains(tmp_path):
+    svc, store = make_service(tmp_path)
+    assert svc.do_register(hint_point())["ok"]
+    p = store.get_point("p.serve")
+    p["tier"] = "private"
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    p["events"] = [{"ts": now, "event": "drift_demotion", "tier": "private"},
+                   {"ts": now, "event": "drift_demotion", "tier": "private"}]
+    store.put_point(p)
+    assert svc._train_reasons(store.get_point("p.serve")) == [
+        "repeated_drift"]
+    # Hosted-tier demotions don't retrain a private point.
+    p = store.get_point("p.serve")
+    for e in p["events"]:
+        e["tier"] = "hosted_jev"
+    store.put_point(p)
+    assert svc._train_reasons(store.get_point("p.serve")) == []
+
+
+def test_Z5_private_teacher_only_heavy(tmp_path):
+    svc, store = make_service(tmp_path)
+    svc.cfg["train"]["min_examples"] = 3
+    assert svc.do_register(hint_point(private_model_only=True))["ok"]
+    store.save_model("p.serve", 1, "private", "v1-1.json",
+                     {"model_ref": "m1", "threshold": 0.5, "job_id": "j0",
+                      "export_seq": 0,
+                      "metrics": {"teacher_only_options": ["b"]}})
+    for i, label in enumerate(["b", "b", "b", "a"]):
+        did = uuid.uuid4().hex
+        store.insert_decision({
+            "decision_id": did, "point_id": "p.serve", "point_version": 1,
+            "ts": f"2026-06-01T00:00:{i:02d}Z",
+            "context": {"label_hint": label}, "options": ["a", "b"],
+            "allowed_options": ["a", "b"], "decider": "private",
+            "probe": {"model_version": "m1",
+                      "probabilities": {"a": 0.4, "b": 0.6}},
+            "mode": "teacher", "source": "do_decide", "phase": "shadow"},
+            100000)
+        assert svc.do_record({"decision_id": did, "choice": label})["ok"]
+    assert svc._train_reasons(store.get_point("p.serve")) == [
+        "teacher_only_heavy"]
+
+
 def test_T_P2_criterion_margin(tmp_path):
     svc, store = _dual_ready(tmp_path)
     _perfect_c(svc, store, "p.serve", 12)
@@ -233,9 +321,7 @@ def test_T_P2_criterion_margin(tmp_path):
     # H1: a perfect baseline already meets the target, so the margin check
     # is skipped instead of refusing an error-free model.
     assert "margin" not in r.get("failed", [])
-    point = store.get_point("p.serve")
-    detail = svc._serve_checks_private(point, True)["margin"]["detail"]
-    assert "skipped" in detail
+    assert "skipped" in r["checks"]["margin"]["detail"]
 
 
 def test_H1_error_free_model_reaches_serve(tmp_path):
@@ -309,6 +395,11 @@ def test_T_P4_drift_demotes_on_audit_evidence(tmp_path, errors, demoted):
     svc, store = make_service(tmp_path)
     assert svc.do_register(hint_point(private_model_only=True,
                                       target_error=0.02))["ok"]
+    # Z2: drift pins the serving model's rows; the epoch predates them.
+    store.save_model("p.serve", 1, "private", "v1-1.json",
+                     {"model_ref": "fake-private", "threshold": 0.5,
+                      "job_id": "j0"})
+    _clear_epoch(store, "p.serve")
     flip_phase(store, "p.serve", "serve")
     for i in range(100):
         wrong = i < errors
@@ -329,10 +420,20 @@ def test_T_P4_drift_demotes_on_audit_evidence(tmp_path, errors, demoted):
         assert store.get_point("p.serve")["events"][-1]["event"] == "drift_demotion"
 
 
+def _clear_epoch(store, pid):
+    p = store.get_point(pid)
+    p["fit_epoch_start"] = ""
+    store.put_point(p)
+
+
 def test_T_P4_no_demotion_below_window(tmp_path):
     svc, store = make_service(tmp_path)
     assert svc.do_register(hint_point(private_model_only=True,
                                       target_error=0.02))["ok"]
+    store.save_model("p.serve", 1, "private", "v1-1.json",
+                     {"model_ref": "fake-private", "threshold": 0.5,
+                      "job_id": "j0"})
+    _clear_epoch(store, "p.serve")
     flip_phase(store, "p.serve", "serve")
     for i in range(99):  # all wrong, but fewer than drift_window audits
         store.insert_decision({

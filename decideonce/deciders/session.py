@@ -243,7 +243,7 @@ class FireworksSessionDecider(Decider):
                 f"fireworks month {month}: budget "
                 f"${self.monthly_budget_usd:.4f} exhausted")
         try:
-            out = sess.score(rows)
+            out = sess.score(rows, timeout)
         except WorkerError as e:
             self._release(reservation)
             raise DeciderError("bad_response",
@@ -254,8 +254,11 @@ class FireworksSessionDecider(Decider):
                 raise DeciderError("unavailable",
                                    "private_warming") from e
             if e.reason == "timeout":
-                # R2-8: the worker may still bill; keep the reservation
-                # for the stale reaper instead of freeing it.
+                # Y9 (was R2-8): the worker may still bill, so settle
+                # the reservation now (G5: a timed-out call records its
+                # estimate). The stale reaper only frees dead-process
+                # orphans (spec §5), never live timeouts.
+                self._settle(reservation, month, self.reserve_usd)
                 raise DeciderError("timeout", "worker_timeout") from e
             self._release(reservation)
             raise DeciderError("unavailable",

@@ -101,6 +101,8 @@ def train_fake_private(store, point_id: str, threshold: float = 0.7,
     card = {"point_id": point_id,
             "point_version": point.get("point_version", 1),
             "kind": "private", "model_version": model_version,
+            # Z2: evidence pins the card's model_ref, like live cards.
+            "model_ref": model_version,
             "threshold": threshold,
             "export_ts": latest.get("ts") or "" if latest else "",
             "export_decision_id": (latest.get("decision_id") or ""

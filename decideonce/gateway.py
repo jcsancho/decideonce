@@ -546,19 +546,29 @@ class Gateway:
             res = self._decide_call(decider, dreq)
             hosted_field: dict | None = None
             decider_tag: str | None = None
+            probe_field: dict | None = None
+            pending_field: dict | None = None
             if res.decider == "private":
                 probe_field = {"model_version": res.model,
                                "probabilities": res.probs}
                 decider_tag = res.decider
+                # Z3: gateway traffic logs the pending checkpoint too
+                # (switch evidence, like the MCP path). Z6: on serve
+                # rows the pending call waits for the audit draw below.
+                if point.get("phase") != "serve":
+                    tmp: dict = {}
+                    self.svc._maybe_store_pending(point, dreq, tmp)
+                    pending_field = tmp.get("pending_probe")
                 zs_full, shown_full = None, res.probs
             else:
                 hosted_field = {
                     "model": res.model, "probabilities": res.probs,
                     "cost_usd": res.cost_usd, "seconds": res.seconds}
                 decider_tag = res.decider
-                tmp: dict = {}
-                self.svc._maybe_store_private(point, dreq, tmp)
-                probe_field = tmp.get("probe")
+                if point.get("phase") != "serve":
+                    tmp: dict = {}
+                    self.svc._maybe_store_private(point, dreq, tmp)
+                    probe_field = tmp.get("probe")
                 zs_full, shown_full = None, res.probs
                 if res.warnings:
                     warnings = warnings + list(res.warnings)
@@ -587,20 +597,32 @@ class Gateway:
                                         rule_hits=rule_hits, warnings=warnings,
                                         jev_zero_shot=zs_full, probe=probe_field,
                                         jev_seconds=jev_seconds, hosted=hosted_field,
-                                        decider=decider_tag)
+                                        decider=decider_tag,
+                                        pending_probe=pending_field)
         mode, _, audit = self.svc._select_mode(point, confidence, top,
                                                probe_field is not None)
+        if audit:
+            # Z6: an audited serve row joins the comparison/switch set,
+            # so score the second model now (skipped above on serve).
+            tmp: dict = {}
+            if res.decider == "private":
+                self.svc._maybe_store_pending(point, dreq, tmp)
+                pending_field = tmp.get("pending_probe")
+            else:
+                self.svc._maybe_store_private(point, dreq, tmp)
+                probe_field = tmp.get("probe")
         if mode != "auto":
             return self._forward_logged(route, req, point, t0, raw_body, context=context,
                                         state_text=state_text, allowed=allowed,
                                         rule_hits=rule_hits, warnings=warnings,
                                         jev_zero_shot=zs_full, probe=probe_field,
                                         jev_seconds=jev_seconds, hosted=hosted_field,
-                                        decider=decider_tag, audit=audit)
+                                        decider=decider_tag, audit=audit,
+                                        pending_probe=pending_field)
         return self._auto(route, req, point, top, shown, confidence, zs_full, probe_field,
                           context, rule_hits, warnings, t0, raw_body, mode="auto",
                           jev_seconds=jev_seconds, hosted=hosted_field,
-                          decider=decider_tag)
+                          decider=decider_tag, pending_probe=pending_field)
 
     @staticmethod
     def _gateway_request(point: dict, context: dict, req):
@@ -657,16 +679,17 @@ class Gateway:
     def _forward_logged(self, route, req, point, t0, raw_body, warnings=None,
                         context=None, state_text=None, allowed=None, rule_hits=None,
                         jev_zero_shot=None, probe=None, jev_seconds=None, audit=False,
-                        hosted=None, decider=None):
+                        hosted=None, decider=None, pending_probe=None):
         return {"action": "forward", "point": point, "t0": t0, "raw_body": raw_body,
                 "warnings": warnings or [], "context": context, "state_text": state_text,
                 "allowed": allowed or list(point["options"]), "rule_hits": rule_hits or [],
                 "jev_zero_shot": jev_zero_shot, "probe": probe, "jev_seconds": jev_seconds,
-                "audit": audit, "hosted": hosted, "decider": decider}
+                "audit": audit, "hosted": hosted, "decider": decider,
+                "pending_probe": pending_probe}
 
     def _auto(self, route, req, point, choice, shown, confidence, zs_full, probe_field,
               context, rule_hits, warnings, t0, raw_body, mode, jev_seconds=None,
-              hosted=None, decider=None):
+              hosted=None, decider=None, pending_probe=None):
         text = GF.render_answer(choice, point.get("output_format") or {})
         for stop in req.get("stop") or []:  # stop/max_tokens gate (§14.4)
             if stop and stop in text:
@@ -677,7 +700,8 @@ class Gateway:
                                                 self._state_text(point, req)),
                                             jev_zero_shot=zs_full, probe=probe_field,
                                             jev_seconds=jev_seconds,
-                                            hosted=hosted, decider=decider)
+                                            hosted=hosted, decider=decider,
+                                            pending_probe=pending_probe)
         mt = req.get("max_tokens")
         if isinstance(mt, int) and -(-len(text) // 3) > mt:
             return self._forward_logged(route, req, point, t0, raw_body,
@@ -687,12 +711,14 @@ class Gateway:
                                             self._state_text(point, req)),
                                         jev_zero_shot=zs_full, probe=probe_field,
                                         jev_seconds=jev_seconds,
-                                        hosted=hosted, decider=decider)
+                                        hosted=hosted, decider=decider,
+                                        pending_probe=pending_probe)
         return {"action": "auto", "point": point, "choice": choice, "text": text,
                 "shown": shown, "confidence": confidence, "jev_zero_shot": zs_full,
                 "probe": probe_field, "context": context, "rule_hits": rule_hits,
                 "warnings": warnings, "t0": t0, "raw_body": raw_body, "mode": mode,
                 "jev_seconds": jev_seconds, "hosted": hosted, "decider": decider,
+                "pending_probe": pending_probe,
                 "state_text": self._trim_state(self._state_text(point, req))}
 
     # -- logging -----------------------------------------------------------
@@ -733,6 +759,7 @@ class Gateway:
             "phase": point.get("phase", "collect"),
             "jev_seconds": plan.get("jev_seconds"), "unparsed": unparsed,
             "hosted": plan.get("hosted"), "decider": plan.get("decider"),
+            "pending_probe": plan.get("pending_probe"),
             "warnings": plan.get("warnings") or None}, self.cfg["store"]["max_rows_per_point"])
         if parsed is not None:
             # gateway teacher labels land at insert: they can complete fits.

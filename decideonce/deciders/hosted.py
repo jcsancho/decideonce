@@ -350,12 +350,16 @@ class HostedJevDecider(Decider):
             probs, cost, toks, warnings = self._parse(
                 status, payload, req, body)
         except DeciderError as e:
-            # R2-8: on timeout the worker thread outlives the deadline and
-            # the upstream call may still be billed. Keep the reservation
-            # for the stale reaper (10x window) instead of freeing it while
-            # billing may land. Other errors never billed: release.
-            if reservation is not None and e.code != "timeout":
-                self._release(reservation)
+            # Y9 (was R2-8): on timeout the worker thread outlives the
+            # deadline and the upstream call may still be billed. Settle
+            # the reservation now (G5: a timed-out call records its
+            # estimate) instead of leaving it for the reaper. Other
+            # errors never billed: release.
+            if reservation is not None:
+                if e.code == "timeout":
+                    self._settle(reservation, month, self.reserve_usd)
+                else:
+                    self._release(reservation)
             raise
         except Exception as e:
             # B1: anything the transport or parse did not already map (a

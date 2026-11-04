@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 from .store import row_key
-from .trainer import Trainer
+from .trainer import IdemInUse, Trainer
 from .trainer_log import parse_account_id, parse_log
 
 RECIPE_MODULE = "training.examples.decision.kalshi_v1.train_kalshi_decision"
@@ -29,14 +29,18 @@ EXIT_TIMEOUT = 124
 EXIT_CANCELLED = 125
 
 RUN_SH = """#!/usr/bin/env bash
-cd -- "$(dirname -- "$0")"  # pid/log/exit land here, not in the spawn cwd
-echo $$ > pid; date +%s > started_at
+JD="$(cd -- "$(dirname -- "$0")" && pwd)"  # this job's dir (absolute)
+CB="$(pwd)"  # the spawn cwd: the cookbook root (GP1)
+echo $$ > "$JD/pid.tmp"; mv -f "$JD/pid.tmp" "$JD/pid"
+date +%s > "$JD/started_at.tmp"; mv -f "$JD/started_at.tmp" "$JD/started_at"
+cd -- "$CB"  # the recipe runs at the cookbook root, exactly as fw.sh does
 set -o pipefail
-"$@" 2>&1 | sed -E 's/fw_[A-Za-z0-9]{8,}/fw_***/g' > train.log
-echo $? > exit_code; date +%s > finished_at
+"$@" 2>&1 | sed -l -E 's/fw_[A-Za-z0-9]{8,}/fw_***/g' > "$JD/train.log"
+code=$?; date +%s > "$JD/finished_at.tmp"; mv -f "$JD/finished_at.tmp" "$JD/finished_at"
+echo $code > "$JD/exit_code.tmp"; mv -f "$JD/exit_code.tmp" "$JD/exit_code"
 """
-# NOTE: no `sed -l` (GNU-only): macOS sed rejects it, and status reads the
-# exit_code file, so block-buffered log writes are harmless.
+# NOTE: `sed -l` (line-buffered) works on both GNU and macOS sed, so live
+# progress reads the log as it grows instead of in 4 KB blocks.
 
 
 def _default_runner(argv: list[str], env: dict, cwd: str):
@@ -143,7 +147,10 @@ class FireworksTrainer(Trainer):
         Training: train tokens × epochs × train price. Evaluation: in-job
         dev scoring (one per epoch plus step 0) for every kind, plus the
         post-job calibration + held-out scoring for full jobs (smoke jobs
-        are checked from their own eval lines, GP6).
+        are checked from their own eval lines, GP6). Y9: the in-job dev
+        part is split out (dev_eval_usd): it bills inside the training
+        session, so the train ledger carries it and finalize must not
+        drop it.
         """
         epochs = int(self.fw.get("epochs", 2) or 2)
         train_p = float(self.fw.get("train_price_per_mtok", 5.86))
@@ -157,6 +164,7 @@ class FireworksTrainer(Trainer):
         train_toks = sum(self._row_tokens(r) for r in train)
         dev_toks = sum(self._row_tokens(r) for r in dev)
         train_usd = train_toks * epochs * train_p / 1e6
+        dev_eval_usd = (epochs + 1) * dev_toks * score_p / 1e6
         eval_toks = (epochs + 1) * dev_toks
         eval_rows = (epochs + 1) * len(dev)
         if kind == "full":
@@ -166,6 +174,7 @@ class FireworksTrainer(Trainer):
         eval_usd = eval_toks * score_p / 1e6
         return {"estimate_usd": train_usd + eval_usd,
                 "train_usd": train_usd, "eval_usd": eval_usd,
+                "dev_eval_usd": dev_eval_usd,
                 "train_rows": len(train), "eval_rows": eval_rows,
                 "train_tokens": train_toks, "eval_tokens": eval_toks,
                 "epochs": epochs, "kind": kind}
@@ -225,8 +234,16 @@ class FireworksTrainer(Trainer):
             raise RuntimeError(f"{pin['status']}: {pin['detail']}")
         if not self.key:
             raise RuntimeError("no_fireworks_key: resolve fireworks.key_ref first")
+        if not re.fullmatch(r"[A-Za-z0-9-]{8,64}", idem or ""):
+            raise ValueError(
+                "bad idem: ^[A-Za-z0-9-]{8,64}$ (Y1: no path traversal)")
         job_dir = self.jobs_dir / idem
-        job_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            job_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            raise IdemInUse(f"idem {idem!r} already has a job directory "
+                            "(Y2: refusing to adopt a stale exit_code)") \
+                from None
         by_split = {"train": [], "calib": [], "heldout": []}
         for r in rows:
             if r.get("split") in by_split:
@@ -279,6 +296,9 @@ class FireworksTrainer(Trainer):
 
     # -- status (GP2 lifecycle) --------------------------------------------
     def _job_dir(self, job_id: str) -> Path:
+        if not re.fullmatch(r"[A-Za-z0-9-]{8,64}", job_id or ""):
+            raise ValueError(
+                "bad job_id: ^[A-Za-z0-9-]{8,64}$ (Y1: no path traversal)")
         return self.jobs_dir / job_id
 
     @staticmethod
@@ -346,30 +366,20 @@ class FireworksTrainer(Trainer):
             return {"status": "failed", "kind": kind, "error": "unknown job"}
         exit_file = job_dir / "exit_code"
         if exit_file.is_file():
-            try:
-                code = int(exit_file.read_text().strip())
-            except ValueError:
-                code = 1
-            if code == 0:
-                ok, why = self._log_confirms(job_dir, kind)
-                if ok:
-                    return {"status": "done", "kind": kind,
-                            **self._done_details(job_dir)}
-                return {"status": "failed", "kind": kind, "error": why}
-            if (job_dir / "timeout").is_file():
-                return {"status": "failed", "kind": kind,
-                        "error": "job_timeout"}
-            if (job_dir / "cancelled").is_file():
-                return {"status": "cancelled", "kind": kind}
-            return {"status": "failed", "kind": kind,
-                    "error": self._log_tail(job_dir),
-                    "account_id": self._log_account_id(job_dir)}
+            return self._status_from_exit(job_dir, kind)
         pid = self._read_pid(job_dir)
         if pid is None:
             return {"status": "failed", "kind": kind,
                     "error": "no pid and no exit_code"}
         if not self._pid_alive(pid) or self._is_zombie(pid):
             # A zombie leader is already dead (kill -0 still answers).
+            # X5: run.sh can finish between the exit check above and this
+            # pid check (the ps spawn alone takes ~10 ms), leaving a stale
+            # dead/zombie observation. Recheck: a dead leader's writes
+            # precede its death, so a missing exit_code here is a real
+            # violent death, not a race.
+            if exit_file.is_file():
+                return self._status_from_exit(job_dir, kind)
             return {"status": "failed", "kind": kind,
                     "error": "pid gone with no exit_code"}
         if self._pid_reused(pid, job_dir):
@@ -382,6 +392,27 @@ class FireworksTrainer(Trainer):
             return {"status": "failed", "kind": kind, "error": "job_timeout"}
         return {"status": "running", "kind": kind}
 
+    def _status_from_exit(self, job_dir: Path, kind: str) -> dict:
+        """Terminal status from a present exit_code file (GP2)."""
+        try:
+            code = int((job_dir / "exit_code").read_text().strip())
+        except ValueError:
+            code = 1
+        if code == 0:
+            ok, why = self._log_confirms(job_dir, kind)
+            if ok:
+                return {"status": "done", "kind": kind,
+                        **self._done_details(job_dir)}
+            return {"status": "failed", "kind": kind, "error": why}
+        if (job_dir / "timeout").is_file():
+            return {"status": "failed", "kind": kind,
+                    "error": "job_timeout"}
+        if (job_dir / "cancelled").is_file():
+            return {"status": "cancelled", "kind": kind}
+        return {"status": "failed", "kind": kind,
+                "error": self._log_tail(job_dir),
+                "account_id": self._log_account_id(job_dir)}
+
     def _log_confirms(self, job_dir: Path, kind: str) -> tuple[bool, str]:
         try:
             parsed = parse_log((job_dir / "train.log").read_text())
@@ -391,9 +422,32 @@ class FireworksTrainer(Trainer):
             if (parsed.get("sampler_checkpoint") or {}).get("name"):
                 return True, ""
             return False, "exited 0 without a sampler checkpoint line"
-        if parsed.get("promoted"):
-            return True, ""
-        return False, "exited 0 without Promoted!"
+        if not parsed.get("promoted"):
+            return False, "exited 0 without Promoted!"
+        # Y12: the promotion must name the model we asked for (the tail
+        # of the log's accounts/.../models/<id> equals meta.json's
+        # --output-model-id). A stale or foreign log can't redirect us
+        # to a different adapter. Tails only: no account id in errors.
+        want = self._meta_model_id(job_dir)
+        got = (parsed.get("model") or "").rsplit("/", 1)[-1]
+        if want is None:
+            return False, "promoted but meta.json has no --output-model-id"
+        if got != want:
+            return False, (f"model_mismatch: log promotes {got!r}, "
+                           f"job asked for {want!r}")
+        return True, ""
+
+    @staticmethod
+    def _meta_model_id(job_dir: Path) -> str | None:
+        """meta.json's --output-model-id, or None when unreadable."""
+        try:
+            argv = json.loads((job_dir / "meta.json").read_text()).get(
+                "argv") or []
+            i = list(argv).index("--output-model-id")
+            want = argv[i + 1]
+        except (OSError, ValueError, IndexError, AttributeError):
+            return None
+        return want if isinstance(want, str) and want else None
 
     def _reap(self, job_id: str) -> None:
         proc = self._procs.get(job_id)
@@ -438,10 +492,16 @@ class FireworksTrainer(Trainer):
     @staticmethod
     def _write_marker(job_dir: Path, name: str, code: int, note: str) -> None:
         """Our own exit record: run.sh died with the group, so it never
-        wrote one. The marker disambiguates our codes from the recipe's."""
-        (job_dir / name).write_text(note + "\n")
-        (job_dir / "exit_code").write_text(f"{code}\n")
-        (job_dir / "finished_at").write_text(f"{int(time.time())}\n")
+        wrote one. The marker disambiguates our codes from the recipe's.
+        Y8: temp + os.replace, like run.sh's mv (no half-written files).
+        exit_code lands last: it is the completion barrier, so observing
+        it means every other marker has settled (no stray .tmp)."""
+        for fname, body in ((name, note + "\n"),
+                            ("finished_at", f"{int(time.time())}\n"),
+                            ("exit_code", f"{code}\n")):
+            tmp = job_dir / f"{fname}.tmp"
+            tmp.write_text(body)
+            os.replace(tmp, job_dir / fname)
         with open(job_dir / "train.log", "a") as f:
             f.write(note + "\n")
 
@@ -452,10 +512,17 @@ class FireworksTrainer(Trainer):
         kind = self._meta_kind(job_dir)
         if not job_dir.is_dir():
             return {"status": "cancelled", "kind": kind}
+        if not (job_dir / "exit_code").is_file() \
+                and not (job_dir / "pid").is_file():
+            # Y10: a spawn may be in flight (pid lands first thing in
+            # run.sh); wait for it instead of stranding the child.
+            self._await_start(job_dir, timeout_s=2.0)
         if (job_dir / "exit_code").is_file():
             return self.status(job_id)
         pid = self._read_pid(job_dir)
-        if pid is not None and self._pid_alive(pid):
+        if pid is not None and self._pid_alive(pid) \
+                and not self._pid_reused(pid, job_dir):
+            # Y8: never signal a reused pid (a stranger's group).
             self._kill_group(pid)
         self._write_marker(job_dir, "cancelled", EXIT_CANCELLED,
                            "cancelled by user")

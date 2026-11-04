@@ -42,13 +42,21 @@ SMOKE_DONE_AT_KEY = "autopilot_smoke_done_at"
 
 # G2: transient status() failures before a running job is declared lost.
 STATUS_LOST_AFTER = 3
-STALE_LAUNCH_S = 15 * 60
+STALE_LAUNCH_S = 10 * 60  # Y9: GP2 says 10 min, not 15
 # G5: backoff after a failed autopilot job before the next launch.
 FAIL_BACKOFF_S = 24 * 3600
 
 
 class JobRunning(Exception):
     """Another job is launching/running (G3 race lost)."""
+
+
+class JobCancelled(Exception):
+    """Y10: our launch lost its claim to a concurrent cancel.
+
+    Carries the temp row id; the row is already cancelled and the
+    just-spawned child was killed, so the caller reports cancelled.
+    """
 
 
 #: Worker calls per evaluation batch (GP6).
@@ -203,6 +211,9 @@ def notify(cmd, line: str) -> None:
 
         t = _th.Thread(target=_run, daemon=True)
         with _notify_lock():
+            # Z7: prune finished threads (production never calls
+            # sync_notifies, so the list would grow without bound).
+            _NOTIFY_THREADS[:] = [u for u in _NOTIFY_THREADS if u.is_alive()]
             _NOTIFY_THREADS.append(t)
         t.start()
     except Exception:
@@ -894,17 +905,33 @@ class Autopilot:
             and not point.get("autopilot_stopped", False)
             and point.get("phase") != "paused")
 
-    def dry_run(self, point: dict) -> dict:
-        """Kind, join list and estimate for the point's next job (no upload)."""
+    def dry_run(self, point: dict, force: bool = False) -> dict:
+        """Kind, join list and estimate for the point's next job (no upload).
+
+        Y11: the trigger always rides (it passed its own gate); any other
+        join needs train_recommended, private_model_only, or a manual
+        force — a point whose hosted Jev is good enough must not silently
+        join a paid job. Excluded joins stay listed with join_ok False.
+        """
         from . import trainer as TR
 
         joins = self.join_candidates()
+        by_id: dict[str, dict] = {}
+        for j in joins:
+            p = self.store.get_point(j["point_id"])
+            if p is not None:
+                by_id[p["point_id"]] = p
+            j["join_ok"] = force or j["point_id"] == point["point_id"] or (
+                p is not None and (p.get("private_model_only")
+                                   or bool(self.svc._train_reasons(p))))
         rows: list[dict] = []
         pts: dict[str, dict] = {}
         for j in joins:
             if not j["allowed"]:
                 continue  # §7.6: never exported, trained or sent
-            p = self.store.get_point(j["point_id"])
+            if not j["join_ok"]:
+                continue  # Y11: hosted Jev serves it; leave it out
+            p = by_id.get(j["point_id"])
             if p is None:
                 continue
             pts[p["point_id"]] = p
@@ -925,6 +952,7 @@ class Autopilot:
         kind = "full" if self.store.smoke_done_exists() else "smoke"
         est = self.svc.trainer.estimate(rows, kind) if self.svc.trainer else {
             "estimate_usd": 0.0, "train_usd": 0.0, "eval_usd": 0.0,
+            "dev_eval_usd": 0.0,
             "train_rows": 0, "eval_rows": 0, "kind": kind}
         return {"kind": kind, "joins": joins, "rows": rows, "estimate": est,
                 "trigger": point["point_id"]}
@@ -959,6 +987,11 @@ class Autopilot:
                 return "privacy"
         if self._counted_usd(dry) is None:
             return "budget"
+        # Y14: §2 step 2 on the paid path too — a full job needs a
+        # post-smoke re-approval, not just an open budget. (The free
+        # path already requires it through free_path_ok's G6.)
+        if dry["kind"] == "full" and not self._smoke_reapproved():
+            return "reapproval"
         return None
 
     def _new_rows_ok(self, point: dict) -> bool:
@@ -1004,11 +1037,18 @@ class Autopilot:
         now = datetime.fromtimestamp(now_ts, tz=timezone.utc)
         if not (now < until and now < MAIN_FREE_CUTOFF_UTC):
             return False
+        return self._smoke_reapproved()
+
+    def _smoke_reapproved(self) -> bool:
+        """G6 (§2 step 2): an approval newer than the last smoke job.
+
+        Shared by the free path (via free_path_ok) and Y14's paid gate:
+        the user saw the smoke outcome and re-approved before any full
+        job may launch automatically.
+        """
         smoke_at = self.store.meta_get(SMOKE_DONE_AT_KEY)
         approved_at = self.store.meta_get(APPROVED_AT_KEY)
-        if not smoke_at or not approved_at:
-            return False
-        return approved_at > smoke_at
+        return bool(smoke_at and approved_at and approved_at > smoke_at)
 
     def manual_free_ok(self, confirmed: bool) -> bool:
         """Manual full job on the free path (§7.3): the call confirms the
@@ -1179,12 +1219,16 @@ class Autopilot:
     def _promote(self, point: dict, phase: str) -> dict:
         gates = self._gates_for_promote(point, phase)
         # E3: a concurrent user pause/demotion wins. Re-read and compare
-        # phase, stop flag and version inside one BEGIN IMMEDIATE; on
-        # mismatch skip without logging or notifying (no stale overwrite).
+        # phase, stop flag, version, suspected, irreversible and the
+        # demotion cooldown inside one BEGIN IMMEDIATE; on mismatch skip
+        # without logging or notifying (no stale overwrite).
         fresh = self.store.cas_point_phase(
             point["point_id"], point.get("phase", "collect"),
             point.get("point_version", 1),
-            bool(point.get("autopilot_stopped", False)), phase)
+            bool(point.get("autopilot_stopped", False)), phase,
+            bool(point.get("suspected", False)),
+            bool(point.get("irreversible", False)),
+            point.get("autopilot_demotion_ts"))
         if fresh is None:
             return {"point_id": point["point_id"],
                     "action": "promotion_skipped",
@@ -1245,10 +1289,14 @@ class Autopilot:
         except JobRunning:
             return {"point_id": point["point_id"], "action": "train_skipped",
                     "reason": "job_running"}
+        except JobCancelled:
+            return {"point_id": point["point_id"], "action": "train_skipped",
+                    "reason": "job_cancelled"}
         h = effective_hash(self.cfg)
         gates = {"kind": dry["kind"], "estimate_usd": dry["estimate"]["estimate_usd"],
                  "counted_usd": counted, "free": dry["kind"] == "full" and self.free_path_ok(),
-                 "joins": [j["point_id"] for j in dry["joins"]]}
+                 "joins": [j["point_id"] for j in dry["joins"]
+                           if j.get("allowed") and j.get("join_ok", True)]}
         line = (f"{point['point_id']} training launched ({dry['kind']} job "
                 f"{job['job_id']}): estimate ${dry['estimate']['estimate_usd']:.4f}")
         self.store.autopilot_log_add(
@@ -1275,13 +1323,15 @@ class Autopilot:
         import sqlite3 as _sqlite3
         import uuid as _uuid
 
-        by_point: dict[str, list] = {}
-        for r in dry["rows"]:
-            by_point.setdefault(r["point_id"], []).append(r)
-        upload = [r for pid, rs in by_point.items()
-                  for r in rs
-                  if next((j for j in dry["joins"]
-                           if j["point_id"] == pid), {}).get("allowed", False)]
+        from .trainer import IdemInUse
+
+        # Y11: upload only joins the dry-run marked (allowed and
+        # join_ok). An unmarked dry is fail-closed: only the trigger rides.
+        marks = {j["point_id"]: (j.get("allowed", False) and j.get(
+            "join_ok", j["point_id"] == point["point_id"]))
+            for j in dry["joins"]}
+        upload = [r for r in dry["rows"]
+                  if marks.get(r["point_id"], False)]
         joins = []
         for j in dry["joins"]:
             rs = [r for r in upload if r["point_id"] == j["point_id"]]
@@ -1293,11 +1343,26 @@ class Autopilot:
                           "export_seq": latest.get("seq")
                           if latest else None})
         idem = idem or _uuid.uuid4().hex
+        # Y2: a used idem shares its live job, but a terminal row
+        # strands its idem (relaunching would adopt a stale exit_code
+        # and orphan a paid job). No DB unique index: temp_id derives
+        # from idem, so a concurrent same-idem insert always collides
+        # on the temp PK and lands in JobRunning below.
+        prior = self.store.job_by_idem(idem)
+        if prior is not None:
+            if prior["status"] in ("running", "launching", "evaluating"):
+                raise JobRunning()
+            raise IdemInUse(f"idem {idem!r} was already used by "
+                            f"{prior['job_id']} ({prior['status']})")
         temp_id = f"launching-{idem[:12]}"
         # F8: the train ledger amount (0 when the free path covers the
-        # train part); counted_usd resets to it when evaluation ends.
+        # train part). Y9: it includes the in-job dev-eval part, which
+        # bills inside the training session; finalize settles the
+        # ledger while counted_usd keeps the launch estimate (the
+        # monthly cap is the sum of autopilot job estimates).
         train_ledger = 0.0 if (free_train and dry["kind"] == "full") \
-            else float(dry["estimate"].get("train_usd", 0))
+            else float(dry["estimate"].get("train_usd", 0)) + float(
+                dry["estimate"].get("dev_eval_usd", 0))
         launching = {"job_id": temp_id, "kind": dry["kind"],
                      "status": "launching",
                      "estimate_usd": dry["estimate"]["estimate_usd"],
@@ -1320,12 +1385,22 @@ class Autopilot:
             raise
         if not self.store.job_claim_launch(temp_id, remote_id, idem):
             # Lost the claim (reconciled concurrently); treat as running-loss.
+            row = self.store.job_get(temp_id)
+            if row is not None and row.get("status") == "cancelled":
+                # Y10: a cancel landed mid-spawn. Our child is already
+                # up under remote_id: kill it (it is untracked now),
+                # then report the cancelled row, not a phantom job.
+                try:
+                    self.svc.trainer.cancel(remote_id)
+                except Exception:
+                    pass
+                raise JobCancelled(temp_id)
             raise JobRunning()
         return self.store.job_get(remote_id) or {**launching, "job_id": remote_id,
                                                  "status": "running"}
 
     def _launch_stale(self, job: dict) -> bool:
-        """A launching row older than the claim window (GP2: 15 min)."""
+        """A launching row older than the claim window (GP2: 10 min)."""
         ts = _parse_ts(job.get("created_at"))
         if ts is None:
             return True
@@ -1334,31 +1409,40 @@ class Autopilot:
     def reconcile_launching(self) -> list[dict]:
         """G1/F4: adopt or fail stale launching rows (crash between insert
         and claim). Young rows are left alone; a stale row is adopted when
-        a job still runs (or finished) under its idem, else failed. A
-        status check that errors leaves the row: absence must be certain,
-        and with no live trainer the remote state is unknown, so those
-        fail (no spend: nothing was confirmed uploaded)."""
+        a job still runs (or finished) under its idem, else failed with
+        its estimate as spend (GP2/G5: it may already have billed). A
+        status check that errors (other than confirmed absence) leaves
+        the row: absence must be proven before failing.
+        """
         out = []
         for job in self.store.jobs_launching():
             if not self._launch_stale(job):
                 continue
             idem = job.get("idempotency_key") or ""
             adopted = False
+            st: dict | None = None
             if idem and self.svc.trainer is not None:
                 try:
                     st = self.svc.trainer.status(idem)
                 except Exception:
                     continue  # uncertain: absence must be proven
-                if st.get("status") in ("running", "done"):
+                if st is not None and st.get("status") in ("running", "done"):
                     adopted = self.store.job_claim_launch(
                         job["job_id"], idem, idem)
             if adopted:
                 continue
-            self.store.job_update(job["job_id"], {"status": "failed",
-                                                  "error": "crashed during launch",
-                                                  "failed_at": _now_iso()})
+            error = "crashed during launch"
+            account_id = None
+            if st is not None and st.get("status") == "failed" \
+                    and st.get("error") != "unknown job":
+                # Y9: the job actually ran and failed: fail it with the
+                # estimate as spend, keeping the trainer's error. Z7: an
+                # "unknown job" is the crash-before-spawn case above.
+                error = st.get("error") or "failed"
+                account_id = st.get("account_id")
+            self._mark_failed(job, error, account_id)
             out.append(self._failed_action({**job, "status": "failed"},
-                                           "crashed during launch"))
+                                           error, account_id=account_id))
         return out
 
     def _recover_done(self) -> list[dict]:
@@ -1398,14 +1482,11 @@ class Autopilot:
                 continue  # F8: owned by its eval thread, not the poll
             try:
                 st = self.svc.trainer.status(job["job_id"])
-            except KeyError:
-                # Confirmed absence: the trainer has no such job.
-                self._mark_failed(job, "trainer lost the job")
-                out.append(self._failed_action(job, "trainer lost the job"))
-                continue
             except Exception:
                 # G2: transient errors must not fail-and-relaunch. Only the
-                # Nth consecutive failure declares the job lost.
+                # Nth consecutive failure declares the job lost. Z7: that
+                # includes KeyError (a trainer bug, not proof of absence;
+                # unknown jobs report failed/"unknown job" instead).
                 n = self.store.job_note_status_failure(job["job_id"])
                 if n >= STATUS_LOST_AFTER:
                     self._mark_failed(job, "trainer unreachable "
@@ -1426,7 +1507,8 @@ class Autopilot:
             if st.get("status") != "done":
                 # Trainer-cancelled behind our back: terminal, never
                 # finalized (no backoff: a cancel is not a failure).
-                self._mark_cancelled(job)
+                if not self._mark_cancelled(job):
+                    continue  # finalize won concurrently; leave it done
                 trigger = (job.get("points") or [{}])[0].get("point_id", "")
                 out.append({"point_id": trigger, "action": "train_cancelled",
                             "job_id": job["job_id"]})
@@ -1455,9 +1537,12 @@ class Autopilot:
 
     def _failed_action(self, job: dict, error: str,
                        action: str = "train_failed",
-                       account_id: str | None = None) -> dict:
+                       account_id: str | None = None,
+                       store=None) -> dict:
         from .trainer_log import redact_account
 
+        if store is None:
+            store = self.store
         error = redact_account(error, account_id)
         trigger = (job.get("points") or [{}])[0].get("point_id", "")
         base: dict = {"point_id": trigger, "action": action,
@@ -1471,7 +1556,7 @@ class Autopilot:
         else:
             line = (f"{trigger} training failed ({job['kind']} job "
                     f"{job['job_id']}): {error}; retry after 24 h backoff")
-        self.store.autopilot_log_add(
+        store.autopilot_log_add(
             {"ts": _now_iso(), "point_id": trigger,
              "action": action, "gates": {"error": error},
              "config_hash": h})
@@ -1491,19 +1576,22 @@ class Autopilot:
         return self._finalize_tail(job, st)
 
     def _finalize_tail(self, job: dict, st: dict,
-                       eval: dict | None = None) -> dict:
+                       eval: dict | None = None, store=None) -> dict:
         """Idempotent finalize tail (F4): models, atomic spend, log line.
 
         Runs after the G4 claim and from recovery. Models are skipped
         when this job's card is already active; spend settles exactly
         once via job_record_spend_finalized. F8: evaluated jobs pass
         their eval doc (per-point T/metrics instead of the checkpoint).
+        Y3: the eval thread passes its own store (the tick's is closed).
         """
+        if store is None:
+            store = self.store
         trigger = (job.get("points") or [{}])[0].get("point_id", "")
         month = _now_iso()[:7]
         if job["kind"] == "smoke":
-            self.store.meta_put(SMOKE_DONE_AT_KEY, _now_iso())
-            self._record_spend(job, month)
+            store.meta_put(SMOKE_DONE_AT_KEY, _now_iso())
+            self._record_spend(job, month, store)
             metrics = st.get("metrics", {})
             if job.get("autopilot"):
                 return self._log_action(
@@ -1513,7 +1601,7 @@ class Autopilot:
                     f"{trigger} smoke job done ({job['job_id']}): "
                     f"{self._smoke_detail(st)}",
                     estimate_usd=job.get("counted_usd"),
-                    account_id=st.get("account_id"))
+                    account_id=st.get("account_id"), store=store)
             return {"point_id": trigger, "action": "smoke_done",
                     "job_id": job["job_id"]}
         if eval is not None:
@@ -1526,8 +1614,11 @@ class Autopilot:
                 continue
             if eval is not None and j["point_id"] not in per_point:
                 continue  # unevaluated join: no card without evidence
-            self._save_private_model(j, job, (per_point.get(j["point_id"]) or {}))
-        self._record_spend(job, month)
+            self._save_private_model(j, job, (per_point.get(j["point_id"]) or {}),
+                                     store)
+        settle = float(job.get("train_usd") or 0) \
+            if eval is not None else None
+        self._record_spend(job, month, store, settle)
         if job.get("autopilot"):
             if eval is not None:
                 return self._log_action(
@@ -1541,7 +1632,7 @@ class Autopilot:
                     f"{trigger} trained (job {job['job_id']}): "
                     f"{eval.get('summary', '')}",
                     estimate_usd=job.get("counted_usd"),
-                    account_id=st.get("account_id"))
+                    account_id=st.get("account_id"), store=store)
             metrics = st.get("metrics", {})
             return self._log_action(
                 trigger, "trained",
@@ -1551,7 +1642,7 @@ class Autopilot:
                 f"accuracy {metrics.get('accuracy')}, "
                 f"{metrics.get('n_train')} train rows",
                 estimate_usd=job.get("counted_usd"),
-                account_id=st.get("account_id"))
+                account_id=st.get("account_id"), store=store)
         return {"point_id": trigger, "action": "trained",
                 "job_id": job["job_id"]}
 
@@ -1621,25 +1712,36 @@ class Autopilot:
     def _run_evaluation(self, job_id: str) -> None:
         """Thread body: evaluate, or terminalize on any failure. Never
         raises (a dead thread with status evaluating would wedge the
-        one-job lock until a restart)."""
+        one-job lock until a restart).
+
+        Y3: the thread opens its own Store. The server tick builds a
+        fresh Service per check and closes its store when the check
+        returns; sharing it would kill the eval mid-run with a closed
+        connection (stuck evaluating, model never saved, spend lost).
+        """
+        from .store import Store
+
+        estore = Store(self.store.root)
         try:
-            self._do_evaluation(job_id)
+            self._do_evaluation(job_id, estore)
         except _EvalCancel:
             pass  # cancel won; the row is already terminal
         except _EvalAbort as e:
             try:
-                job = self.store.job_get(job_id)
+                job = estore.job_get(job_id)
                 if job is not None and job["status"] == "evaluating":
-                    self._eval_failed(job, str(e))
+                    self._eval_failed(job, str(e), estore)
             except Exception:
                 pass
         except Exception as e:  # noqa: BLE001 - last resort, still terminal
             try:
-                job = self.store.job_get(job_id)
+                job = estore.job_get(job_id)
                 if job is not None and job["status"] == "evaluating":
-                    self._eval_failed(job, f"eval crashed: {e}")
+                    self._eval_failed(job, f"eval crashed: {e}", estore)
             except Exception:
                 pass
+        finally:
+            estore.close()
 
     def _eval_worker(self, model: str) -> WorkerSession:
         argv = None
@@ -1649,8 +1751,8 @@ class Autopilot:
             self.cfg, model, self.store.root / "jobs",
             self.svc.fireworks_key or "", worker_argv=argv)
 
-    def _do_evaluation(self, job_id: str) -> None:
-        job = self.store.job_get(job_id)
+    def _do_evaluation(self, job_id: str, store) -> None:
+        job = store.job_get(job_id)
         if job is None or job["status"] != "evaluating":
             return
         st = self.svc.trainer.status(job_id)
@@ -1669,11 +1771,11 @@ class Autopilot:
         cancel_ev = self._eval_cancel.get(job_id) or threading.Event()
         sess = self._eval_worker(model)
         try:
-            scored_c = self._eval_score(sess, job, calib, cancel_ev)
-            scored_h = self._eval_score(sess, job, held, cancel_ev)
+            scored_c = self._eval_score(sess, job, calib, cancel_ev, store)
+            scored_h = self._eval_score(sess, job, held, cancel_ev, store)
         finally:
             sess.close()
-        self._raise_if_cancelled(job_id, cancel_ev)
+        self._raise_if_cancelled(job_id, cancel_ev, store)
         uploads = {j["point_id"]: j.get("n_upload", 0)
                    for j in job.get("points", [])}
         total_up = sum(uploads.values())
@@ -1686,7 +1788,7 @@ class Autopilot:
             per_point[pid] = self._eval_fit_point(
                 pid, c, h, recipe_t, model,
                 train_ledger * share, job.get("created_at", ""),
-                uploads.get(pid, 0))
+                uploads.get(pid, 0), store)
         unevaluated = sorted(
             p for p in uploads if p not in per_point and uploads[p])
         doc = {
@@ -1703,23 +1805,25 @@ class Autopilot:
                 for p, m in sorted(per_point.items())) or "no eval rows",
             "finished_at": _now_iso(),
         }
-        self.store.job_save_eval(job_id, doc)
-        self.store.job_update(job_id, {"counted_usd": train_ledger})
-        self._raise_if_cancelled(job_id, cancel_ev)
-        if not self.store.job_claim_evaluated(job_id):
+        store.job_save_eval(job_id, doc)
+        # Y9: counted_usd keeps the launch estimate (the monthly cap
+        # sums estimates); the tail settles the train ledger while the
+        # per-call eval spend already settled live.
+        self._raise_if_cancelled(job_id, cancel_ev, store)
+        if not store.job_claim_evaluated(job_id):
             return  # lost the race (cancel/retry/recovery claimed first)
-        self._finalize_tail(self.store.job_get(job_id), st, doc)
+        self._finalize_tail(store.job_get(job_id), st, doc, store)
 
     def _raise_if_cancelled(self, job_id: str,
-                            cancel_ev: threading.Event) -> None:
+                            cancel_ev: threading.Event, store) -> None:
         if cancel_ev.is_set():
             raise _EvalCancel()
-        job = self.store.job_get(job_id)
+        job = store.job_get(job_id)
         if job is None or job["status"] != "evaluating":
             raise _EvalCancel()
 
     def _eval_score(self, sess: WorkerSession, job: dict, rows: list[dict],
-                    cancel_ev: threading.Event) -> list[tuple]:
+                    cancel_ev: threading.Event, store) -> list[tuple]:
         """Score rows in batches of 32: [(row, pid, logprobs, label_idx)].
 
         Each worker call settles immediately (spend_add); a batch that
@@ -1739,18 +1843,23 @@ class Autopilot:
         except (TypeError, ValueError):
             budget = 0.0
         month = _now_iso()[:7]
+        # Y9: the running job's train part settles at finalize, so it is
+        # committed spend for this check, like open serving reservations.
+        train_commit = float(job.get("train_usd") or 0)
         for b in range(0, len(rows), EVAL_BATCH):
             batch = rows[b:b + EVAL_BATCH]
-            self._raise_if_cancelled(job["job_id"], cancel_ev)
+            self._raise_if_cancelled(job["job_id"], cancel_ev, store)
             est = sum(_toks([r]) for r in batch) * price / 1e6
-            spent = self.store.spend_get(month, "fireworks")["usd"]
-            if budget <= 0 or spent + est > budget:
+            spent = store.spend_get(month, "fireworks")["usd"]
+            open_usd = store.spend_open(month, "fireworks")["usd"]
+            committed = spent + open_usd + train_commit
+            if budget <= 0 or committed + est > budget:
                 raise _EvalAbort(
                     f"budget_exceeded: eval batch ${est:.4f} over "
-                    f"remaining ${max(budget - spent, 0.0):.4f}")
+                    f"remaining ${max(budget - committed, 0.0):.4f}")
             try:
                 out = self._eval_wait_ready(sess, batch, cancel_ev,
-                                            job["job_id"])
+                                            job["job_id"], store)
             except WorkerError as e:
                 raise _EvalAbort(f"worker: {e}"[:200])
             except WorkerUnavailable as e:
@@ -1762,7 +1871,7 @@ class Autopilot:
             if not isinstance(toks, (int, float)) or toks < 0:
                 toks = sum(_toks([r]) for r in batch)
             actual = toks * price / 1e6
-            self.store.spend_add(month, "fireworks", actual)
+            store.spend_add(month, "fireworks", actual)
             denom = sum(_toks([r]) for r in batch) or 1
             for r, lps in zip(batch, lpss):
                 pid, keys, y = self._eval_row_label(r)
@@ -1793,21 +1902,27 @@ class Autopilot:
         return pid, keys, keys.index(label)
 
     def _eval_wait_ready(self, sess: WorkerSession, batch: list[dict],
-                         cancel_ev: threading.Event, job_id: str) -> dict:
+                         cancel_ev: threading.Event, job_id: str,
+                         store) -> dict:
         """score() through the warming window (bounded by eval_ready_s)."""
         try:
             cap = float(self.cfg.get("fireworks", {}).get("eval_ready_s",
                                                            600))
         except (TypeError, ValueError):
             cap = 600.0
+        try:
+            call_timeout = float(self.cfg.get("fireworks", {}).get(
+                "eval_timeout_s", 600))
+        except (TypeError, ValueError):
+            call_timeout = 600.0
         deadline = time.monotonic() + max(cap, 0.0)
         while True:
             try:
-                return sess.score(batch)
+                return sess.score(batch, call_timeout)
             except WorkerUnavailable as e:
                 if e.reason != "warming":
                     raise
-            self._raise_if_cancelled(job_id, cancel_ev)
+            self._raise_if_cancelled(job_id, cancel_ev, store)
             if time.monotonic() >= deadline:
                 raise _EvalAbort(
                     f"worker_warming_timeout after {cap:g}s")
@@ -1816,9 +1931,9 @@ class Autopilot:
     def _eval_fit_point(self, pid: str, calib: list[tuple],
                         held: list[tuple], recipe_t: float | None,
                         model: str, train_cost: float,
-                        created_at: str, n_upload: int) -> dict:
+                        created_at: str, n_upload: int, store) -> dict:
         """Per-point T (GP4), §6.1 threshold and §7.2 step 4 metrics."""
-        point = self.store.get_point(pid)
+        point = store.get_point(pid)
         target = float((point or {}).get("target_error")
                        or self.cfg["serve"]["target_error"])
         support = int(self.cfg["serve"]["min_auto_support"])
@@ -1940,24 +2055,27 @@ class Autopilot:
                        if prec + rec > 0 else 0.0)
         return sum(f1s) / len(f1s)
 
-    def _eval_failed(self, job: dict, error: str) -> dict:
+    def _eval_failed(self, job: dict, error: str, store=None) -> dict:
         """Terminalize a failed evaluation: the train part records, the
         settled per-call spend stays, the old model stays, retry_eval
         can retry. Spend finalizes exactly once (conditional)."""
         from .trainer_log import redact_account
 
+        if store is None:
+            store = self.store
         error = redact_account(error)
         train = float(job.get("train_usd") or 0)
         month = _now_iso()[:7]
-        self.store.job_update(job["job_id"], {"counted_usd": train})
-        self.store.job_record_spend_finalized(job["job_id"], train, month)
-        self.store.job_update(job["job_id"], {"status": "eval_failed",
-                                              "error": error,
-                                              "failed_at": _now_iso()})
+        # Y9: counted_usd keeps the launch estimate for the monthly cap.
+        store.job_record_spend_finalized(job["job_id"], train, month)
+        store.job_update(job["job_id"], {"status": "eval_failed",
+                                         "error": error,
+                                         "failed_at": _now_iso()})
         # No thread-tracking cleanup here: a live thread may still be
         # settling its in-flight call; join_eval and the poll reaper own
         # that once the thread actually exits.
-        return self._failed_action(job, error, action="eval_failed")
+        return self._failed_action(job, error, action="eval_failed",
+                                   store=store)
 
     def recover_interrupted_evals(self) -> list[dict]:
         """Server startup (F9 wires it): jobs still evaluating died with
@@ -1965,13 +2083,29 @@ class Autopilot:
         return [self._eval_failed(job, "server_restart")
                 for job in self.store.jobs_evaluating()]
 
-    def _record_spend(self, job: dict, month: str) -> None:
-        counted = float(job.get("counted_usd", 0))
-        self.store.job_record_spend_finalized(job["job_id"], counted, month)
+    def _record_spend(self, job: dict, month: str, store=None,
+                      settle: float | None = None) -> None:
+        """Settle the job's in-session spend exactly once (conditional).
 
-    def _mark_cancelled(self, job: dict) -> None:
+        Y9: an evaluated job settles its train ledger (the post-job eval
+        part already settled per call); anything else settles the
+        counted estimate. counted_usd itself never changes after launch.
+        """
+        if store is None:
+            store = self.store
+        if settle is None:
+            settle = float(job.get("counted_usd", 0))
+        store.job_record_spend_finalized(job["job_id"], settle, month)
+
+    def _mark_cancelled(self, job: dict) -> bool:
         """F4: cancel a job: no relaunch, ever. Spend counts like a failure
-        (conservative: a cancelled job may already have billed)."""
+        (conservative: a cancelled job may already have billed).
+
+        Y10: compare-and-set against the finalize claims. True when we
+        won; False (row already done/failed/cancelled) records nothing,
+        so a cancel that loses to job_claim_evaluated can neither
+        double-count the train spend nor strand a done job as cancelled.
+        """
         if job.get("status") == "evaluating":
             # F8: stop the eval thread; the train part records (it ran)
             # and the settled per-call spend stays. Never the full
@@ -1981,30 +2115,37 @@ class Autopilot:
                 ev.set()
             train = float(job.get("train_usd") or 0)
             month = _now_iso()[:7]
-            self.store.job_update(job["job_id"], {"counted_usd": train})
+            if not self.store.job_mark_cancelled(job["job_id"], train, None):
+                return False
+            # Y9: counted_usd keeps the launch estimate for the monthly cap.
             self.store.spend_add(month, "fireworks", train)
-            self.store.job_update(job["job_id"], {"status": "cancelled",
-                                                  "spend_usd": train,
-                                                  "error": "cancelled by user"})
-            return
-        self._mark_failed(job, "cancelled by user")
-        self.store.job_update(job["job_id"], {"status": "cancelled"})
+            return True
+        counted = float(job.get("counted_usd", 0))
+        if not self.store.job_mark_cancelled(job["job_id"], None,
+                                             _now_iso()):
+            return False
+        if counted > 0:
+            self.store.spend_add(_now_iso()[:7], "fireworks", counted)
+        return True
 
-    def _save_private_model(self, join: dict, job: dict, model: dict) -> None:
+    def _save_private_model(self, join: dict, job: dict, model: dict,
+                              store=None) -> None:
         """Model card file + active kind=private model + export marker."""
         import json as _json
 
-        point = self.store.get_point(join["point_id"])
+        if store is None:
+            store = self.store
+        point = store.get_point(join["point_id"])
         if point is None:
             return
-        cur = self.store.active_model(join["point_id"], "private")
+        cur = store.active_model(join["point_id"], "private")
         if cur is not None and cur.get("card", {}).get("job_id") == job["job_id"]:
             return  # F4: recovery re-run; this job's card is already active
         pending = point.get("pending_private_model") or {}
         if pending.get("job_id") == job["job_id"]:
             return  # F9: recovery re-run; this job's card is already pending
         ver = point.get("point_version", 1)
-        dest = self.store.models_dir / point["point_id"]
+        dest = store.models_dir / point["point_id"]
         dest.mkdir(parents=True, exist_ok=True)
         n = 1
         while (dest / f"v{ver}-{n}.json").exists():
@@ -2033,9 +2174,11 @@ class Autopilot:
                 "eval_tokens": model.get("eval_tokens"),
                 "eval_cost_usd": model.get("eval_cost_usd")})
         else:
-            # Fake-era card (offline gate tests pin this shape).
+            # Fake-era card (offline gate tests pin this shape). Z2: it
+            # still names its model, so evidence pins to this checkpoint.
             card["hint_map"] = model.get("hint_map", {})
             card["sampler"] = f"fakeckpt:{job['job_id']}"
+            card["model_ref"] = card["sampler"]
         (dest / f"v{ver}-{n}.json").write_text(_json.dumps(card, indent=1))
         # F9 (§7.2 step 5): a serve-phase private-tier point keeps
         # answering with its current checkpoint; the new card waits as
@@ -2043,22 +2186,30 @@ class Autopilot:
         # other phase/tier switches at once.
         serve_private = point.get("phase") == "serve" \
             and self.svc._effective_tier(point) == "private"
-        mid = self.store.save_model(point["point_id"], ver, "private",
-                                    f"v{ver}-{n}.json", card,
-                                    active=not serve_private)
+        mid = store.save_model(point["point_id"], ver, "private",
+                               f"v{ver}-{n}.json", card,
+                               active=not serve_private)
+        if not serve_private and "pending_private_model" in point:
+            # Z3: immediate activation voids any stale pending marker (a
+            # demotion should already have cleared it; this is the backstop
+            # so an older checkpoint can never be switched in later).
+            del point["pending_private_model"]
+            store.put_point(point)
         if serve_private:
             point["pending_private_model"] = {"model_id": mid,
                                               "job_id": job["job_id"]}
         point["last_train_export_ts"] = join.get("export_ts", "")
         point["last_train_export_id"] = join.get("export_id", "")
         point["last_train_export_seq"] = join.get("export_seq")
-        self.store.put_point(point)
+        store.put_point(point)
 
     def _log_action(self, point_id: str, action: str, gates: dict,
                     line: str, estimate_usd=None,
-                    account_id: str | None = None) -> dict:
+                    account_id: str | None = None, store=None) -> dict:
         from .trainer_log import redact_account, redact_obj
 
+        if store is None:
+            store = self.store
         line = redact_account(line, account_id)
         gates = redact_obj(gates, account_id)
         h = effective_hash(self.cfg)
@@ -2066,7 +2217,7 @@ class Autopilot:
                        "action": action, "gates": gates, "config_hash": h}
         if estimate_usd is not None:
             entry["estimate_usd"] = estimate_usd
-        self.store.autopilot_log_add(entry)
+        store.autopilot_log_add(entry)
         notify(self._notify_cmd_for(fallback_to_current=True), line)
         return {"point_id": point_id, "action": action, "line": line}
 

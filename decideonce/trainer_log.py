@@ -71,7 +71,10 @@ _TASKS_RE = re.compile(r"tasks=(\d+)")
 _CAL_RE = "Decision calibration: T="
 _SAMPLER_RE = re.compile(r"Sampler checkpoint '([^']+)' saved")
 _STORED_RE = re.compile(r"Sampler server-stored name '([^']+)' differs")
-_MODEL_RE = re.compile(r"-> model '([^']+)'")
+# Y12: only the promotion line names the model (GP5). A bare "-> model"
+# anywhere else (an argv echo, a debug line) must not set it.
+_MODEL_RE = re.compile(
+    r"Promoting session checkpoint '[^']+' -> model '([^']+)'")
 
 
 def parse_log(text: str) -> dict:

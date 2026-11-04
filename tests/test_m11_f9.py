@@ -601,6 +601,87 @@ def test_T_FW8_collect_and_shadow_switch_at_once(tmp_path):
         assert "pending_private_model" not in store.get_point(pid)
 
 
+# -- Z3: pending lifecycle ----------------------------------------------------------
+
+def test_Z3_drift_demotion_clears_pending(tmp_path):
+    svc, store, _, dec = _switch_svc(tmp_path, pid="f9.zd")
+    try:
+        _switch_cards(store, "f9.zd")
+        assert store.get_point("f9.zd")["pending_private_model"]
+        for i in range(100):
+            label = "ab"[i % 2]
+            r = svc.do_decide({"point_id": "f9.zd",
+                               "context": {"label_hint": label}})
+            assert r["ok"], r
+            rec = svc.do_record({"decision_id": r["decision_id"],
+                                 "choice": "ab"[(i + 1) % 2]})
+            assert rec["ok"], rec
+        assert store.get_point("f9.zd")["phase"] == "shadow"
+        assert "pending_private_model" not in store.get_point("f9.zd")
+        assert svc._pending_private_model(
+            store.get_point("f9.zd")) is None
+    finally:
+        dec.close()
+
+
+def test_Z3_manual_demotion_clears_pending(tmp_path):
+    svc, store, _, dec = _switch_svc(tmp_path, pid="f9.zm")
+    try:
+        _switch_cards(store, "f9.zm")
+        assert store.get_point("f9.zm")["pending_private_model"]
+        r = svc.do_promote({"point_id": "f9.zm", "phase": "collect"})
+        assert r["ok"], r
+        assert "pending_private_model" not in store.get_point("f9.zm")
+    finally:
+        dec.close()
+
+
+def test_Z3_reregister_carries_pending(tmp_path):
+    svc, store, _, dec = _switch_svc(tmp_path, pid="f9.zr")
+    try:
+        mid = _switch_cards(store, "f9.zr")
+        r = svc.do_register(_point(
+            "f9.zr", data_class="private", private_model_only=True,
+            remote_ok=["fireworks"], confirm=True, target_error=0.3))
+        assert r["ok"], r
+        assert store.get_point("f9.zr")["pending_private_model"] == {
+            "model_id": mid, "job_id": "j-new"}
+    finally:
+        dec.close()
+
+
+# -- Z4: shadow serving gate + plan label -------------------------------------------
+
+def test_Z4_private_shadow_needs_serving_gate_and_budget(tmp_path):
+    svc, store, cfg = _svc(tmp_path, fw={"allow_session_serving": False})
+    assert svc.do_register(_point("f9.sh", private_model_only=True))["ok"]
+    store.save_model("f9.sh", 1, "private", "v1-1.json",
+                     {"model_ref": "m", "temperature": 1.0, "job_id": "j0"})
+    r = svc.do_promote({"point_id": "f9.sh", "phase": "shadow"})
+    assert r["ok"] is False and r["error"] == "serving_not_allowed", r
+    cfg["fireworks"]["allow_session_serving"] = True
+    cfg["fireworks"]["monthly_budget_usd"] = 0.0
+    r = svc.do_promote({"point_id": "f9.sh", "phase": "shadow"})
+    assert r["ok"] is False and r["failed"] == ["budget"], r
+    cfg["fireworks"]["monthly_budget_usd"] = 100.0
+    r = svc.do_promote({"point_id": "f9.sh", "phase": "shadow"})
+    assert r["ok"], r
+
+
+def test_Z4_plan_gp11_label(tmp_path):
+    from decideonce.deciders.session import FireworksSessionDecider
+
+    svc, store, cfg = _svc(tmp_path, fw={"allow_session_serving": False})
+    assert svc.do_register(_point("f9.pl", private_model_only=True))["ok"]
+    p = store.get_point("f9.pl")
+    p["plan_phase"] = "shadow"
+    store.put_point(p)
+    svc.deciders["private"] = FireworksSessionDecider(store, cfg, "k")
+    svc._plan_eligible_hosted = lambda _p: True  # orthogonal to the label
+    _, warns = svc._plan_predict(store.get_point("f9.pl"), "do it", {}, False)
+    assert warns == ["f9.pl: serving_not_allowed"]
+
+
 # -- T-FW11: paid-job gate ------------------------------------------------------
 
 def _trained_points(svc, *pids):
@@ -664,3 +745,98 @@ def test_T_FW11_leftover_jev_config_refused(tmp_path):
     with pytest.raises(ConfigError) as e:
         load_config(jev_toml)
     assert e.value.code == "config_v16_migration"
+
+
+# -- Y1/Y2: idem validation + reuse ----------------------------------------------
+
+def test_Y1_do_train_idem_schema(tmp_path):
+    svc, _, _ = _svc(tmp_path)
+    assert svc.do_register(_point())["ok"]
+    for bad in ("../../evil-12345", "short", "has space!!"):
+        r = svc.do_train({"point_id": "f9.pt", "force": True,
+                          "confirm": True, "idem": bad})
+        assert r["ok"] is False and r["error"] == "invalid_args", (bad, r)
+
+
+def test_Y2_sequential_reuse_refused(tmp_path):
+    svc, _, _ = _svc(tmp_path)
+    assert svc.do_register(_point())["ok"]
+    _add_rows(svc, "f9.pt")
+    r = svc.do_train({"point_id": "f9.pt", "force": True, "confirm": True,
+                      "idem": "idem-reuse-1"})
+    assert r["status"] == "running"
+    c = svc.do_train({"point_id": "f9.pt", "force": True, "cancel": True})
+    assert c["status"] == "cancelled"
+    r2 = svc.do_train({"point_id": "f9.pt", "force": True, "confirm": True,
+                       "idem": "idem-reuse-1"})
+    assert r2["ok"] is False and r2["error"] == "idem_in_use", r2
+    assert len(svc.trainer.uploaded) == 1
+
+
+# -- Y10: cancel races ------------------------------------------------------------
+
+def _y10_row(idem, train_usd=1.5, counted_usd=2.0):
+    return {"job_id": f"launching-{idem[:12]}", "kind": "smoke",
+            "status": "launching", "estimate_usd": 2.0,
+            "counted_usd": counted_usd, "train_usd": train_usd,
+            "points": [{"point_id": "f9.pt"}], "autopilot": False,
+            "created_at": "2026-11-04T00:00:00Z",
+            "idempotency_key": idem}
+
+
+def test_Y10_cancel_loses_to_eval_claim(tmp_path):
+    svc, store, _ = _svc(tmp_path)
+    assert svc.do_register(_point())["ok"]
+    store.job_insert_launching(_y10_row("idem-eval-race-lost"))
+    jid = "launching-idem-eval-ra"
+    store.job_update(jid, {"status": "evaluating"})
+    stale = store.job_get(jid)
+    assert stale["status"] == "evaluating"
+    assert store.job_claim_evaluated(jid)  # the eval thread wins
+    assert svc.autopilot._mark_cancelled(stale) is False
+    assert store.job_get(jid)["status"] == "done"
+    assert store.spend_get(_month(), "fireworks")["usd"] == 0
+
+
+def test_Y10_cancel_wins_on_evaluating(tmp_path):
+    svc, store, _ = _svc(tmp_path)
+    assert svc.do_register(_point())["ok"]
+    store.job_insert_launching(_y10_row("idem-eval-race-won"))
+    jid = "launching-idem-eval-ra"
+    store.job_update(jid, {"status": "evaluating"})
+    assert svc.autopilot._mark_cancelled(store.job_get(jid)) is True
+    row = store.job_get(jid)
+    assert row["status"] == "cancelled"
+    assert row["spend_usd"] == pytest.approx(1.5)
+    # Y9: the launch estimate stays for the monthly cap (sums estimates).
+    assert row["counted_usd"] == pytest.approx(2.0)
+    assert store.spend_get(_month(), "fireworks")["usd"] == pytest.approx(1.5)
+
+
+def test_Y10_launch_loses_claim_to_cancel(tmp_path):
+    svc, store, _ = _svc(tmp_path)
+    assert svc.do_register(_point())["ok"]
+    _add_rows(svc, "f9.pt")
+    real_launch = svc.trainer.launch
+    real_cancel = svc.trainer.cancel
+    kills: list = []
+
+    def launch(rows, kind, idem=""):
+        # a concurrent cancel lands mid-spawn, before our claim.
+        store.job_update(f"launching-{idem[:12]}", {"status": "cancelled",
+                                                   "error": "cancelled by user"})
+        return real_launch(rows, kind, idem)
+
+    def cancel(job_id):
+        kills.append(job_id)
+        return real_cancel(job_id)
+
+    svc.trainer.launch = launch
+    svc.trainer.cancel = cancel
+    idem = "idem-cancel-race"
+    r = svc.do_train({"point_id": "f9.pt", "force": True, "confirm": True,
+                      "idem": idem})
+    assert r["ok"] and r["status"] == "cancelled", r
+    assert r["job_id"] == f"launching-{idem[:12]}"
+    assert len(kills) == 1  # our just-spawned child was killed, not orphaned
+    assert svc.trainer.jobs[kills[0]]["status"] == "cancelled"

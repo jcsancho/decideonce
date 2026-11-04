@@ -305,7 +305,16 @@ defence in depth, not a sandbox.
 ## Private model (Fireworks)
 
 Where hosted Jev is not good enough, a point can train its own Glimmer LoRA
-on Fireworks (one per project, your account). Prerequisites:
+on Fireworks (one per project, your account).
+
+> **Status (4 Nov 2026):** the integrated trainer and scoring worker are tested
+> offline (fake child processes and a fake worker) but have **not yet run a live
+> Fireworks job through DecideOnce**. The recipe itself was run by hand during the
+> event with the same cookbook: `refund-decide-v1` reached 98.0% vs 79.0% for base
+> Glimmer on 300 held-out synthetic refund decisions (one run, one synthetic task).
+> Treat the private tier as experimental.
+
+Prerequisites:
 
 - the cookbook clone at the pinned commit (`[fireworks] cookbook_dir` +
   `cookbook_commit`) with `uv sync` run in its `training/` directory;

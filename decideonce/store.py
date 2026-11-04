@@ -465,13 +465,18 @@ class Store:
 
     def cas_point_phase(self, point_id: str, expected_phase: str,
                         expected_version: int, expected_stopped: bool,
-                        new_phase: str) -> dict | None:
+                        new_phase: str, expected_suspected: bool = False,
+                        expected_irreversible: bool = False,
+                        expected_demotion_ts=None) -> dict | None:
         """E3: atomic compare-and-set for autopilot promotion.
 
-        Re-reads the point and checks phase, stop flag and version inside
-        one BEGIN IMMEDIATE. Returns the fresh point after the update, or
-        None when the point is missing or any expectation mismatches (a
-        concurrent user pause/demotion wins; the caller must not promote).
+        Re-reads the point and checks phase, stop flag, version,
+        suspected, irreversible and the demotion cooldown inside one
+        BEGIN IMMEDIATE (Z7: the last three used to be unchecked, so a
+        concurrent flag/cooldown change lost the race silently).
+        Returns the fresh point after the update, or None when the point
+        is missing or any expectation mismatches (a concurrent user
+        pause/demotion wins; the caller must not promote).
         """
         self.cx.execute("BEGIN IMMEDIATE")
         try:
@@ -483,7 +488,10 @@ class Store:
             fresh = json.loads(row["data"])
             if (fresh.get("phase", "collect") != expected_phase
                     or fresh.get("point_version", 1) != expected_version
-                    or bool(fresh.get("autopilot_stopped", False)) != bool(expected_stopped)):
+                    or bool(fresh.get("autopilot_stopped", False)) != bool(expected_stopped)
+                    or bool(fresh.get("suspected", False)) != bool(expected_suspected)
+                    or bool(fresh.get("irreversible", False)) != bool(expected_irreversible)
+                    or fresh.get("autopilot_demotion_ts") != expected_demotion_ts):
                 self.cx.execute("ROLLBACK")
                 return None
             fresh["phase"] = new_phase
@@ -952,6 +960,38 @@ class Store:
         row = self.cx.execute("SELECT * FROM jobs WHERE job_id=?",
                               (job_id,)).fetchone()
         return self._parse_job(row) if row else None
+
+    def job_by_idem(self, idem: str) -> dict | None:
+        """Y2: the newest row carrying an idempotency key, if any."""
+        row = self.cx.execute(
+            "SELECT * FROM jobs WHERE idempotency_key=? "
+            "ORDER BY created_at DESC LIMIT 1", (idem,)).fetchone()
+        return self._parse_job(row) if row else None
+
+    def job_mark_cancelled(self, job_id: str, spend_usd: float | None,
+                           failed_at: str | None) -> bool:
+        """Y10: conditional live -> cancelled. True when we won.
+
+        spend_usd/failed_at mirror _mark_cancelled's per-branch fields
+        (None leaves the column alone); the loser (finalize or another
+        cancel already moved the row) changes nothing.
+        """
+        sets = ["status='cancelled'", "error='cancelled by user'",
+                "updated_at=?"]
+        params: list = [_utcnow()]
+        if spend_usd is not None:
+            sets.append("spend_usd=?")
+            params.append(float(spend_usd))
+        if failed_at is not None:
+            sets.append("failed_at=?")
+            params.append(failed_at)
+        params.append(job_id)
+        with self.cx:
+            cur = self.cx.execute(
+                f"UPDATE jobs SET {', '.join(sets)} WHERE job_id=? "
+                "AND status IN ('running', 'launching', 'evaluating')",
+                params)
+            return cur.rowcount == 1
 
     def job_update(self, job_id: str, fields: dict) -> None:
         fields = dict(fields)
@@ -1658,6 +1698,12 @@ for _name in ("version", "migrate", "close", "put_point", "get_point", "list_poi
               "cas_point_phase", "try_record_teacher", "try_set_outcome",
               "eval_only_transcript_ids", "purge_extracted_text",
               "purge_plans", "transcript_plan_flags",
-              "autopilot_month_counted"):
+              "autopilot_month_counted",
+              "activate_model", "get_model",
+              "job_by_idem", "job_mark_cancelled",
+              "jobs_evaluating", "jobs_eval_failed", "job_begin_eval",
+              "job_claim_evaluated", "job_retry_eval", "job_save_eval",
+              "job_get_eval", "jobs_done_unfinalized",
+              "job_record_spend_finalized"):
     setattr(Store, _name, _locked(getattr(Store, _name)))
 del _name

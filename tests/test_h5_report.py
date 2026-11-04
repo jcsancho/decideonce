@@ -27,8 +27,8 @@ def clock(monkeypatch):
     return state
 
 
-def make_dual(tmp_path, hosted_fn, private_fn=None, model_version="fp-1",
-              **hj_over):
+def make_dual(tmp_path, hosted_fn, private_fn=None,
+              model_version="fake-private-1", **hj_over):
     cfg = load_config()
     cfg["store"]["data_dir"] = str(tmp_path)
     cfg["decider"]["backend"] = "tiered"
@@ -189,11 +189,18 @@ def test_T_HJ3_reason_repeated_drift(tmp_path):
 
 
 def test_T_HJ3_reason_teacher_only_heavy(tmp_path, clock):
-    svc, store, _ = make_dual(
+    svc, store, cfg = make_dual(
         tmp_path, scripted_hosted(lambda i, hint, opts: (hint, 0.9)),
         fit_rows=10)
+    cfg["serve"]["min_auto_support"] = 3
+    cfg["train"]["min_examples"] = 3
     assert svc.do_register(point())["ok"]
     assert svc.do_promote({"point_id": "h5.pt", "phase": "shadow"})["ok"]
+    for i in range(7):
+        decide_label(svc, "a")
+    for i in range(3):
+        decide_label(svc, "b")
+    # Z5: rule 4 counts evidence rows (post-fit), not the fit rows.
     for i in range(7):
         decide_label(svc, "a")
     for i in range(3):
@@ -222,6 +229,31 @@ def test_T_HJ3_not_otherwise(tmp_path, clock):
     assert rep["hosted"]["fit"]["teacher_only_options"] == []
 
 
+def test_Z6_no_private_scoring_on_unaudited_serve(tmp_path, clock):
+    svc, store, cfg = make_dual(
+        tmp_path, scripted_hosted(lambda i, hint, opts: (hint, 0.9)),
+        scripted_private(lambda i, hint, opts: (hint, 0.9)), fit_rows=10)
+    cfg["serve"]["audit_rate"] = 0.0
+    assert svc.do_register(point())["ok"]
+    assert svc.do_promote({"point_id": "h5.pt", "phase": "shadow"})["ok"]
+    for _ in range(10):
+        decide_label(svc, "a")
+    TR.train_fake_private(store, "h5.pt", threshold=0.7)
+    for _ in range(3):
+        decide_label(svc, "a")
+    rows = store.decisions_for_point("h5.pt")
+    assert all(r.get("probe") for r in rows[-3:])  # shadow still logs
+    p = store.get_point("h5.pt")
+    p["phase"] = "serve"
+    store.put_point(p)
+    for _ in range(3):
+        decide_label(svc, "a")
+    rows = store.decisions_for_point("h5.pt")
+    assert all(r.get("hosted") for r in rows[-3:])
+    assert not any(r.get("audit") for r in rows[-3:])
+    assert not any(r.get("probe") for r in rows[-3:])
+
+
 # -- T-HJ4 do_train precondition --------------------------------------------
 
 
@@ -229,11 +261,18 @@ def test_T_HJ4_hosted_sufficient_then_not_built(tmp_path, clock):
     svc, store, cfg = make_dual(
         tmp_path, scripted_hosted(lambda i, hint, opts: (hint, 0.9)),
         fit_rows=10)
+    cfg["serve"]["min_auto_support"] = 3
+    cfg["train"]["min_examples"] = 3
     assert svc.do_register(point())["ok"]
     r = svc.do_train({"point_id": "h5.pt"})
     assert r["ok"] is False and r["error"] == "hosted_jev_sufficient"
     assert "hosted" in r and r["train_recommended"] is False
     assert svc.do_promote({"point_id": "h5.pt", "phase": "shadow"})["ok"]
+    for _ in range(7):
+        decide_label(svc, "a")
+    for _ in range(3):
+        decide_label(svc, "b")
+    # Z5: rule 4 needs mature evidence rows, not just the fit rows.
     for _ in range(7):
         decide_label(svc, "a")
     for _ in range(3):

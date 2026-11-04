@@ -15,6 +15,14 @@ from .fireworks_export import TRAIN_ONLY_SOURCES
 from .store import row_key as _row_key
 
 
+class IdemInUse(Exception):
+    """Y2: an idempotency key whose job row or directory already exists.
+
+    Terminal rows strand their idem (reusing one would adopt a stale
+    exit_code and orphan a paid job); live rows share via JobRunning.
+    """
+
+
 class Trainer(ABC):
     """Async training-job backend (main spec §7.5)."""
 
@@ -35,7 +43,12 @@ class Trainer(ABC):
 
     @abstractmethod
     def status(self, job_id: str) -> dict:
-        """Poll a job: {"status": running|done|failed, ...metrics when done}."""
+        """Poll a job: {"status": running|done|failed, ...metrics when done}.
+
+        Z7: an unknown job reports failed/"unknown job" (like the live
+        trainer's missing directory), never raises KeyError, so the
+        poll's backoff treats a real KeyError (a bug) as transient.
+        """
 
     @abstractmethod
     def cancel(self, job_id: str) -> dict:
@@ -68,7 +81,9 @@ def live_trainer_unavailable_reason(cfg: dict, store, key) -> str:
     pin = FireworksTrainer(cfg, store.root / "jobs", key=key).pin_status()
     if pin["status"] == "ok":
         return ""
-    if pin["status"] == "missing":
+    # Y13: pin_status says "cookbook_missing", not "missing" (a missing
+    # cookbook was reported as a mismatch).
+    if pin["status"] == "cookbook_missing":
         return "cookbook_missing"
     return "cookbook_mismatch"
 
@@ -207,7 +222,10 @@ class FakeTrainer(Trainer):
         return self.status(job_id)
 
     def status(self, job_id: str) -> dict:
-        job = self.jobs[job_id]
+        job = self.jobs.get(job_id)
+        if job is None:
+            # Z7: unknown jobs report absence (live-trainer parity).
+            return {"status": "failed", "kind": "", "error": "unknown job"}
         out: dict = {"status": job["status"], "kind": job["kind"]}
         if job["status"] == "done":
             out["metrics"] = dict(job["metrics"])

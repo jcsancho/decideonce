@@ -323,6 +323,15 @@ class Service:
                        "last_train_export_seq", "extraction_unreliable"):
                 if _k in stored:
                     point[_k] = stored[_k]
+            # Z3: the pending checkpoint survives a re-register (it is
+            # server state, not registration input).
+            if "pending_private_model" in stored:
+                point["pending_private_model"] = dict(
+                    stored["pending_private_model"])
+            # Z7: an omitted policy is not a removal (and must not bump
+            # the version): carry the stored one.
+            if args.get("policy") is None and "policy" in stored:
+                point["policy"] = stored["policy"]
             if "events" in stored:
                 point["events"] = [dict(e) for e in stored["events"]]
             # R2-1: plan has its own epoch; old points backfill from decide.
@@ -356,8 +365,10 @@ class Service:
                     # are shadow rows). Gateway points already go back.
                     point["phase"] = "shadow"
                 # E4: a version-bump demotion (serve -> shadow) starts the
-                # cooldown like any other demotion.
+                # cooldown like any other demotion. Z3: it also voids the
+                # pending checkpoint (evidence predates the new version).
                 if _prev_phase == "serve" and point["phase"] == "shadow":
+                    point.pop("pending_private_model", None)
                     self._note_demotion_cooldown(point)
         self.store.put_point(point)
         if stored is not None and point["point_version"] != stored.get(
@@ -711,12 +722,14 @@ class Service:
                 base_row["probe"] = {
                     "model_version": res.model,
                     "probabilities": res.probs}
-                self._maybe_store_pending(point, req, base_row)
+                # The pending checkpoint is scored after mode selection
+                # (below): unaudited serve rows never enter the switch
+                # set, so scoring them wastes a session call (Z6).
             else:
                 base_row["hosted"] = {
                     "model": res.model, "probabilities": res.probs,
                     "cost_usd": res.cost_usd, "seconds": res.seconds}
-                self._maybe_store_private(point, req, base_row)
+                # Same for the comparison probe (Z6).
             base_row["decider"] = res.decider
             if res.warnings:
                 warnings = warnings + list(res.warnings)
@@ -750,6 +763,14 @@ class Service:
         confidence = max(shown.values()) if shown else 0.0
         top = S.argmax(shown, allowed)
         mode, choice, audit = self._select_mode(point, confidence, top, probe_used)
+        if point.get("phase") != "serve" or audit:
+            # Z6: comparison/switch sets cover shadow + audited serve
+            # only; an unaudited serve row must not pay for a second
+            # session call.
+            if res.decider == "private":
+                self._maybe_store_pending(point, req, base_row)
+            else:
+                self._maybe_store_private(point, req, base_row)
         base_row["mode"] = mode
         base_row["audit"] = audit
         if mode == "auto":
@@ -1305,12 +1326,18 @@ class Service:
         """Comparison set C (§6.4 item 8): tier-labelled rows decided after
         the private export, in shadow (or audited serve), with both models'
         probabilities stored, and no hosted fit row. since (M16) further
-        keeps rows decided after a demotion only."""
+        keeps rows decided after a demotion only. Z2: the probe must pin
+        this card's model_ref, so a retrain's evidence never includes the
+        old checkpoint's rows."""
         mseq, legacy = self._export_marker_seq(card)
+        ref = card.get("model_ref")
+        if ref is None:
+            return []  # a card that names no model pins no rows
         fit = self._hosted_fit(point)
         fit_ids = set(fit.get("fit_ids") or []) if fit else set()
         return [(r, lab) for r, lab in self._tier_rows(point)
-                if r.get("probe")
+                if (r.get("probe") or {}).get("probabilities")
+                and (r.get("probe") or {}).get("model_version") == ref
                 and (r.get("phase") == "shadow"
                      or (r.get("phase") == "serve" and r.get("audit")))
                 and _after_marker(r, mseq, legacy)
@@ -1319,6 +1346,45 @@ class Service:
                 # A3: on a followed row the outcome marked wrong the true
                 # label is unknown, so neither model can be scored on it.
                 and L.resolve_label(r)[1] != "outcome_bad_no_fix"]
+
+    def _private_evidence_rows(self, point: dict, card: dict,
+                               since: tuple | None = None
+                               ) -> list[tuple[dict, str]]:
+        """Private-tier evidence (Z1): labelled rows this private model
+        decided itself, after its export, in shadow (or audited serve).
+        Mirrors _comparison_rows' unbiased rule but needs no hosted arm:
+        the row's probe must pin the card's model_ref, and decider must be
+        private (pre-M12 legacy rows carry probes with no decider field).
+        """
+        mseq, legacy = self._export_marker_seq(card)
+        ver = point.get("point_version", 1)
+        ref = card.get("model_ref")
+        if ref is None:
+            return []  # a card that names no model pins no rows
+        out = []
+        for r in self.store.decisions_for_point(point["point_id"]):
+            pp = r.get("probe") or {}
+            if not pp.get("probabilities") or pp.get("model_version") != ref:
+                continue
+            if r.get("decider") != "private":
+                continue
+            if r.get("source") not in LIVE_SOURCES:
+                continue
+            if r.get("point_version") != ver:
+                continue
+            if not (r.get("phase") == "shadow"
+                    or (r.get("phase") == "serve" and r.get("audit"))):
+                continue
+            if not _after_marker(r, mseq, legacy):
+                continue
+            if L.resolve_label(r)[1] == "outcome_bad_no_fix":
+                continue
+            label = self._tier_label(r, point)
+            if label is None:
+                continue
+            out.append((r, label))
+        out.sort(key=lambda t: _row_key(t[0]))
+        return out
 
     def _pending_rows(self, point: dict, card: dict,
                       ) -> list[tuple[dict, str]]:
@@ -1546,7 +1612,7 @@ class Service:
         """The four train_recommended rules of main spec §7.7 (H5). Rules 1-2
         need a mature point (fit fired + min_examples evidence rows)."""
         if not self._hosted_tier(point):
-            return []
+            return self._train_reasons_private(point)
         reasons = []
         fit = self._hosted_fit(point)
         T = float(fit["temperature"]) if fit else 1.0
@@ -1582,10 +1648,53 @@ class Service:
                 recent += 1
         if recent >= 2:
             reasons.append("repeated_drift")
-        if fit:
+        # Z5: rule 4 measures the teacher-only share on evidence rows with
+        # the same maturity gate as rules 1-2. Counting fit rows is
+        # circular (the fit defined teacher_only_options from them).
+        if mature:
             to = fit.get("teacher_only_options") or []
             if to:
-                labs = [lab for _, lab in self._tier_rows(point)]
+                labs = [lab for _, lab in ev]
+                if labs and sum(1 for lab in labs if lab in to) / len(labs) \
+                        > 0.2:
+                    reasons.append("teacher_only_heavy")
+        return reasons
+
+    def _train_reasons_private(self, point: dict) -> list[str]:
+        """Retrain triggers for private-tier points (Z5). Rules 1-2 are
+        hosted-specific (no hosted arm runs here); repeated private drift
+        and teacher-only growth over the serving model's evidence retrain.
+        """
+        reasons = []
+        window_s = float(
+            self.cfg["hosted_jev"]["redemote_window_days"]) * 86400
+        now = time.time()
+        recent = 0
+        for e in point.get("events", []):
+            if e.get("event") != "drift_demotion" \
+                    or e.get("tier") != "private":
+                continue
+            try:
+                from datetime import datetime
+                raw = e.get("ts", "")
+                ts = datetime.fromisoformat(
+                    raw.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if now - ts <= window_s:
+                recent += 1
+        if recent >= 2:
+            reasons.append("repeated_drift")
+        model = self.store.active_model(point["point_id"], "private")
+        card = {}
+        if model is not None and model.get("point_version") == point.get(
+                "point_version", 1):
+            card = model.get("card", {})
+        to = (card.get("metrics") or {}).get("teacher_only_options") or []
+        if to:
+            ev = self._private_evidence_rows(point, card)
+            if len(ev) >= self.cfg["train"]["min_examples"]:
+                labs = [lab for _, lab in ev]
                 if labs and sum(1 for lab in labs if lab in to) / len(labs) \
                         > 0.2:
                     reasons.append("teacher_only_heavy")
@@ -1769,12 +1878,31 @@ class Service:
             return False
         if self._hosted_tier(point):
             return self._drift_check_hosted(point)
-        # Private tier: drift on the stored private probabilities.
+        # Private tier: drift on the stored private probabilities. Z2: the
+        # window covers the serving model's rows only (A5 mirror: current
+        # version and epoch, probe pinned to the active card). Without the
+        # pin, a retrain is judged on the old checkpoint's rows; without
+        # the epoch, a re-promoted point is demoted again by pre-demotion
+        # audits.
         target = point.get("target_error", self.cfg["serve"]["target_error"])
         window = self.cfg["serve"]["drift_window"]
+        model = self.store.active_model(point_id, "private")
+        card = {}
+        if model is not None and model.get("point_version") == point.get(
+                "point_version", 1):
+            card = model.get("card", {})
+        ref = card.get("model_ref")
+        if ref is None:
+            return False
+        ver = point.get("point_version", 1)
+        epoch = point.get("fit_epoch_start", "")
         audits = [r for r in self.store.decisions_for_point(point_id)
                   if r.get("audit") and r.get("teacher_choice")
-                  and r.get("source") in LIVE_SOURCES]
+                  and r.get("source") in LIVE_SOURCES
+                  and (r.get("probe") or {}).get("probabilities")
+                  and (r.get("probe") or {}).get("model_version") == ref
+                  and r.get("point_version") == ver
+                  and (r.get("ts") or "") >= epoch]
         last = audits[-window:]
         if len(last) < window:
             return False
@@ -1782,13 +1910,19 @@ class Service:
         errs = sum(1 for r in last if self._probe_top(r) != r["teacher_choice"])
         if errs / n > 2 * target and S.wilson_lower(errs, n) > target:
             point["phase"] = "shadow"
+            point["fit_epoch_start"] = _utcnow()
+            # Z3: a demotion voids the pending checkpoint (its evidence
+            # predates the demotion); it must never be switched in later.
+            point.pop("pending_private_model", None)
             self._note_demotion_cooldown(point)
             point.setdefault("events", []).append(
                 {"ts": _utcnow(), "event": "drift_demotion",
+                 "tier": "private",
                  "errors": errs, "n": n, "target": target})
             self.store.put_point(point)
             self.autopilot.note_demotion(
-                point, {"errors": errs, "n": n, "target": target})
+                point, {"errors": errs, "n": n, "target": target,
+                        "tier": "private"})
             return True
         return False
 
@@ -1823,6 +1957,7 @@ class Service:
         if errs / n > 2 * target and S.wilson_lower(errs, n) > target:
             point["phase"] = "shadow"
             point["fit_epoch_start"] = _utcnow()
+            point.pop("pending_private_model", None)  # Z3: as above
             self._note_demotion_cooldown(point)
             self.store.deactivate_hosted_fit(point["point_id"], "decide")
             point.setdefault("events", []).append(
@@ -2505,7 +2640,7 @@ class Service:
                 return ok(job_id=job["job_id"], status=job["status"],
                           kind=job["kind"], estimate_usd=job["estimate_usd"])
             return self._launching_response(launching[0])
-        dry = ap.dry_run(point)
+        dry = ap.dry_run(point, force=bool(args.get("force", False)))
         if args.get("dry_run", False):
             return ok(dry_run=True, kind=dry["kind"], joins=dry["joins"],
                       estimate=dry["estimate"], trigger=point["point_id"])
@@ -2546,7 +2681,8 @@ class Service:
             return err("budget_exceeded",
                        f"estimate ${counted:.4f} exceeds the remaining "
                        f"Fireworks budget", estimate_usd=counted)
-        from .autopilot import JobRunning
+        from .autopilot import JobCancelled, JobRunning
+        from .trainer import IdemInUse
 
         try:
             job = ap.launch_job(point, dry, counted, autopilot=False,
@@ -2560,6 +2696,12 @@ class Service:
             return ok(job_id=job0.get("job_id"),
                       status=job0.get("status", "running"),
                       kind=job0.get("kind"), estimate_usd=job0.get("estimate_usd", 0))
+        except JobCancelled as e:
+            return ok(job_id=str(e), status="cancelled",
+                      kind=dry["kind"],
+                      estimate_usd=dry["estimate"]["estimate_usd"])
+        except IdemInUse as e:
+            return err("idem_in_use", str(e))
         return ok(job_id=job["job_id"], status="running", kind=job["kind"],
                   estimate_usd=job["estimate_usd"])
 
@@ -2606,7 +2748,12 @@ class Service:
                 self.trainer.cancel(tid)
             except Exception as e:
                 return err("cancel_failed", f"trainer cancel failed: {e}")
-        ap._mark_cancelled(job)
+        if not ap._mark_cancelled(job):
+            # Y10: finalize won the race; report the terminal state.
+            cur = self.store.job_get(job["job_id"]) or {}
+            return err("job_not_running",
+                       f"job {job['job_id']!r} is "
+                       f"{cur.get('status', 'done')} (cancel arrived late)")
         return out
 
     def _dm_train_retry_eval(self, args: dict, point: dict) -> dict:
@@ -2718,6 +2865,9 @@ class Service:
             self.store.put_point(point)
             return ok(point_id=point["point_id"], phase="serve", checks=checks)
         self._autopilot_note_manual_move(point, target)
+        if point.get("phase") == "serve":
+            # Z3: leaving serve voids the pending checkpoint.
+            point.pop("pending_private_model", None)
         point["phase"] = target
         self.store.put_point(point)
         return ok(point_id=point["point_id"], phase=target)
@@ -2760,9 +2910,12 @@ class Service:
 
     def _promote_shadow_private(self, point: dict) -> dict:
         """Shadow on the private tier (§2.7): the Fireworks key (fakes skip
-        it) plus a trained private model for the current version. The key
-        gates first: training needs it too, so a keyless point is told to
-        set the key before it is told to train."""
+        it), a trained private model for the current version, the GP11
+        serving gate and a budget. Gates run in fix order: the key (train
+        needs it), the model (train it), then serving and the budget (Z4:
+        shadow scores the session on every decision, like autopilot's
+        shadow gate requires).
+        """
         if getattr(self.trainer, "needs_key", True) and not self.fireworks_key:
             return err("no_fireworks_key",
                        "set fireworks.key_ref to serve the private tier")
@@ -2772,6 +2925,18 @@ class Service:
             return err("private_model_not_trained",
                        "shadow on the private tier needs a trained private "
                        "model (do_train)")
+        if not self.cfg.get("fireworks", {}).get("allow_session_serving",
+                                                 False):
+            return err("serving_not_allowed",
+                       "shadow on the private tier needs "
+                       "fireworks.allow_session_serving (GP11)")
+        if float(self.cfg["fireworks"].get("monthly_budget_usd") or 0) <= 0:
+            checks = {"budget": {
+                "pass": False,
+                "detail": "shadow needs fireworks.monthly_budget_usd > 0"}}
+            return err("promotion_refused",
+                       "shadow needs a fireworks budget",
+                       failed=["budget"], checks=checks)
         self._autopilot_note_manual_move(point, "shadow")
         point["phase"] = "shadow"
         self.store.put_point(point)
@@ -2960,7 +3125,14 @@ class Service:
     def _serve_checks_private(self, point: dict, confirm: bool,
                               since: tuple | None = None) -> dict:
         """§6.4 for the private tier on fakes (H5; M11 refines): items 1-7
-        over the comparison set C with the private threshold, plus item 8."""
+        over the comparison set C with the private threshold, plus item 8.
+
+        Z1: points already on the private tier (private_model_only or a
+        drift-demoted tier=private) take the private evidence path
+        instead: their rows carry probes, not hosted, so C is empty.
+        """
+        if self._effective_tier(point) == "private":
+            return self._serve_checks_private_evidence(point, confirm, since)
         from . import stats as S
         tc, sc = self.cfg["train"], self.cfg["serve"]
         target = point.get("target_error", sc["target_error"])
@@ -3056,6 +3228,103 @@ class Service:
                        f"{comp['discordant_hosted_only']}/"
                        f"{comp['discordant_private_only']}, McNemar p="
                        f"{comp['mcnemar_p']:.4f}")}
+        return checks
+
+    def _serve_checks_private_evidence(self, point: dict, confirm: bool,
+                                       since: tuple | None = None) -> dict:
+        """§6.4 items 1-7 for points already on the private tier (Z1), over
+        the private evidence rows with the active card's threshold. The
+        stored probe probabilities are final (tempered at decide time), so
+        no fit and no tempering. Item 8 passes: no tier switch, no hosted
+        arm to beat."""
+        from . import stats as S
+        tc, sc = self.cfg["train"], self.cfg["serve"]
+        target = point.get("target_error", sc["target_error"])
+        model = self.store.active_model(point["point_id"], "private")
+        card = {}
+        if model is not None and model.get("point_version") == point.get(
+                "point_version", 1):
+            card = model.get("card", {})
+        ev = self._private_evidence_rows(point, card, since)
+        options = list(point["options"])
+        scored = []
+        for r, label in ev:
+            allowed = r.get("allowed_options") or options
+            pm = S.mask_and_renorm(
+                (r.get("probe") or {}).get("probabilities") or {}, allowed)
+            scored.append((max(pm.values()) if pm else 0.0,
+                           S.argmax(pm, allowed) == label if pm else False))
+        tp = card.get("threshold")
+        checks: dict[str, dict] = {}
+        checks["min_examples"] = {
+            "pass": len(ev) >= tc["min_examples"],
+            "detail": f"{len(ev)} labelled private evidence rows, need "
+                      f"{tc['min_examples']}"}
+        checks["threshold"] = {
+            "pass": tp is not None,
+            "detail": f"private threshold={tp}"}
+        pool = [(c, ok) for c, ok in scored if tp is not None and c >= tp]
+        coverage = len(pool) / len(scored) if scored else 0.0
+        checks["coverage"] = {
+            "pass": tp is not None and coverage >= sc["min_coverage"],
+            "detail": f"coverage={coverage:.3f}, need {sc['min_coverage']}"}
+        n_pool, e_pool = len(pool), sum(1 for _, ok in pool if not ok)
+        upper = S.wilson_upper(e_pool, n_pool) if n_pool else 1.0
+        checks["evidence"] = {
+            "pass": n_pool > 0 and upper <= target,
+            "detail": f"pool n={n_pool}, errors={e_pool}, "
+                      f"Wilson upper={upper:.4f}, target={target}"}
+        acc = (sum(1 for _, ok in scored if ok) / len(scored)
+               if scored else 0.0)
+        baseline = 1.0 - acc
+        pool_err = (e_pool / n_pool) if n_pool else 1.0
+        checks["margin"] = self._margin_check(
+            n_pool, pool_err, baseline, target, sc["min_margin_vs_random"],
+            "evidence baseline")
+        checks["shadow"] = {
+            "pass": len(ev) >= sc["min_shadow"],
+            "detail": f"{len(ev)} evidence rows, need {sc['min_shadow']}"}
+        latest = scored[-sc["min_shadow"]:] if scored else []
+        agree = (sum(1 for _, ok in latest if ok) / len(latest)
+                 if latest else None)
+        checks["shadow_agreement"] = {
+            "pass": agree is not None and len(latest) >= sc["min_shadow"]
+            and abs(agree - acc) <= 0.05,
+            "detail": f"evidence agreement latest {agree} vs overall "
+                      f"{acc:.3f} (need within 0.05)"}
+        rows = self.store.decisions_for_point(point["point_id"])
+        both, disagree = L.teacher_disagreement(rows)
+        unreliable = both > 0 and disagree / both > tc["teacher_alarm"]
+        checks["teacher"] = {
+            "pass": not unreliable,
+            "detail": f"outcome/teacher disagreements {disagree}/{both} "
+                      f"(alarm above {tc['teacher_alarm']})"}
+        checks["confirm"] = {"pass": bool(confirm),
+                             "Detail": "the user agreed" if confirm else "confirm: true required"}
+        if point.get("source") == "gateway":
+            from . import gateway as GW
+            fe = GW.format_evidence(self.cfg, self.store, point)
+            gcfg = self.cfg["gateway"]
+            n_ok = fe["n_compared"] >= gcfg["format_min_n"]
+            wl = fe["wilson_lower"]
+            w_ok = wl is not None and wl >= gcfg["format_match_min"]
+            ur = fe["unparsed_rate"]
+            u_ok = ur is not None and ur <= gcfg["max_unparsed"]
+            checks["gateway_format"] = {
+                "pass": n_ok and w_ok and u_ok,
+                "detail": (f"compared={fe['n_compared']}/{gcfg['format_min_n']}, "
+                           f"match {fe['n_match']}/{fe['n_compared']} "
+                           f"(Wilson lower {_fmt_num(wl)}, need "
+                           f"{gcfg['format_match_min']}), unparsed "
+                           f"{fe['n_unparsed']}/{fe['n_answered']} "
+                           f"({_fmt_num(ur)}, max {gcfg['max_unparsed']})")}
+        if point.get("private_model_only"):
+            detail = ("not required for private_model_only "
+                      "(no hosted-Jev arm)")
+        else:
+            detail = ("already on the private tier (no tier switch, "
+                      "no hosted arm to beat)")
+        checks["private_item8"] = {"pass": True, "detail": detail}
         return checks
 
     def _promote_plan_phase(self, args: dict) -> dict:
@@ -3841,8 +4110,13 @@ class Service:
             if e.code == "remote_not_allowed":
                 # R2-10: unlike do_decide's collect-like silence, a plan
                 # row blocked by privacy must warn so P3 counts it as a
-                # failure instead of silently unpredicted.
-                warns.append(f"{point['point_id']}: remote_not_allowed")
+                # failure instead of silently unpredicted. Z4: the GP11
+                # serving gate is not a privacy refusal; label it so.
+                if e.msg == "serving_not_allowed":
+                    warns.append(
+                        f"{point['point_id']}: serving_not_allowed")
+                else:
+                    warns.append(f"{point['point_id']}: remote_not_allowed")
                 return entry, warns
             record_decider_error(self.store, decider, point["point_id"], e)
             tag = {"budget_exceeded": "budget_exceeded",

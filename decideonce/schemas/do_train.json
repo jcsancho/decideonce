@@ -23,7 +23,8 @@
       "type": "boolean"
     },
     "idem": {
-      "type": "string"
+      "type": "string",
+      "pattern": "^[A-Za-z0-9-]{8,64}$"
     },
     "cancel": {
       "type": [

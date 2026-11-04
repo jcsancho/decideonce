@@ -129,8 +129,13 @@ def _launch_full(svc, pid="e.pt"):
 
 def _finish_full(svc, job_id, log=FULL_LOG):
     jd = Path(svc.cfg["store"]["data_dir"]) / "jobs" / job_id
-    (jd / "train.log").write_text(log)
+    # Y12: the log must promote the id meta.json asked for, like the
+    # real recipe does; splice the job's own --output-model-id in.
+    argv = json.loads((jd / "meta.json").read_text())["argv"]
+    mid = argv[argv.index("--output-model-id") + 1]
+    (jd / "train.log").write_text(log.replace("dk-t-0001", mid))
     (jd / "exit_code").write_text("0")
+    return f"accounts/acct-test/models/{mid}"
 
 
 def _poll_eval(svc, pid="e.pt"):
@@ -181,19 +186,20 @@ def test_T_FW4_fallback_below_5_errors():
 def test_eval_status_enriches_from_log(tmp_path):
     svc, _, _ = _setup(tmp_path)
     tr = svc.trainer
-    jd = Path(svc.cfg["store"]["data_dir"]) / "jobs" / "jd1"
+    jd = Path(svc.cfg["store"]["data_dir"]) / "jobs" / "jd1-eval-0001"
     jd.mkdir(parents=True)
     (jd / "meta.json").write_text(json.dumps(
-        {"kind": "full", "n_train": 150, "estimate": {"eval_rows": 40}}))
+        {"kind": "full", "n_train": 150, "estimate": {"eval_rows": 40},
+         "argv": ["recipe", "--output-model-id", "dk-t-0001"]}))
     (jd / "train.log").write_text(FULL_LOG)
     (jd / "exit_code").write_text("0")
-    st = tr.status("jd1")
+    st = tr.status("jd1-eval-0001")
     assert st["status"] == "done"
     assert st["model"] == MODEL
     assert st["recipe_temperature"] == pytest.approx(RECIPE_T)
     assert st["metrics"]["eval_accuracy"] == pytest.approx(0.88)
     assert st["metrics"]["n_train"] == 150
-    rows = tr.eval_rows("jd1")
+    rows = tr.eval_rows("jd1-eval-0001")
     assert rows == {"calib": [], "heldout": []}  # missing files, no crash
 
 
@@ -220,15 +226,18 @@ def test_T_FW4_eval_fits_T(tmp_path):
     sid = _finish_smoke(svc)
     smoke_counted = store.job_get(sid)["counted_usd"]
     jid = _launch_full(svc)
-    _finish_full(svc, jid)
+    launch_counted = store.job_get(jid)["counted_usd"]
+    want_model = _finish_full(svc, jid)
     assert _poll_eval(svc) == jid
     assert svc.autopilot.join_eval(jid, timeout=60)
     job = store.job_get(jid)
     assert job["status"] == "done" and job["finalized"]
-    assert job["counted_usd"] == pytest.approx(job["train_usd"])  # cap reset
+    # Y9: the monthly cap sums launch estimates, so counted never resets.
+    assert job["counted_usd"] == pytest.approx(launch_counted)
+    assert job["train_usd"] > 0
     card = store.active_model("e.pt", "private")["card"]
     assert card["scoring"] == "session_forward"
-    assert card["model_ref"] == MODEL
+    assert card["model_ref"] == want_model
     assert card["temperature_source"] == "fit"
     assert card["temperature"] != pytest.approx(RECIPE_T)
     assert card["recipe_temperature"] == pytest.approx(RECIPE_T)
@@ -238,6 +247,9 @@ def test_T_FW4_eval_fits_T(tmp_path):
     assert card["accuracy"] == pytest.approx(want_acc)
     assert card["metrics"]["n_holdout"] == n
     assert card["metrics"]["n_calib"] > 0
+    # T-T6: random-escalation error is the overall error.
+    assert card["metrics"]["random_escalation_error"] == pytest.approx(
+        1.0 - card["metrics"]["accuracy"])
     # No double counting: smoke counted + train ledger + settled eval.
     assert store.spend_get(_month(), "fireworks")["usd"] == pytest.approx(
         smoke_counted + job["train_usd"]
@@ -448,3 +460,163 @@ def test_T_PT9_private_plan_gate(tmp_path):
         assert e["status"] == "decided"
     finally:
         dec.close()
+
+
+# -- Y3: eval thread owns its store ----------------------------------------------
+
+def test_Y3_eval_survives_main_store_close(tmp_path):
+    svc, store, _ = _setup(tmp_path)
+    for i in range(70):
+        _add_row(svc, "abc"[i % 3])
+    _finish_smoke(svc)
+    jid = _launch_full(svc)
+    _finish_full(svc, jid)
+    assert _poll_eval(svc) == jid
+    store.close()  # the server tick's finally, mid-eval
+    assert svc.autopilot.join_eval(jid, timeout=120)
+    store2 = Store(store.root)
+    try:
+        assert store2.job_get(jid)["status"] == "done"
+        assert store2.active_model("e.pt", "private") is not None
+    finally:
+        store2.close()
+
+
+def test_Y5_eval_uses_eval_timeout(tmp_path):
+    import threading
+
+    svc, store, _ = _setup(tmp_path, fake_args=("slow", "4"))
+    sess = svc.autopilot._eval_worker(MODEL)
+    try:
+        row = {"state": {"policy": "P"},
+               "questions": {"e.pt": {
+                   "type": "choice", "instructions": "Q?",
+                   "criteria": {"a": "a", "b": "b"}, "label": "a"}}}
+        out = svc.autopilot._eval_wait_ready(
+            sess, [row], threading.Event(), "j-eval-timeout", store)
+        assert len(out["logprobs"]) == 1
+    finally:
+        sess.close()
+
+
+# -- Z1: private-tier serve path -------------------------------------------------
+
+def test_Z1_pmo_shadow_to_serve_with_real_private_rows(tmp_path):
+    svc, store, cfg = _setup(tmp_path)
+    cfg["train"]["min_examples"] = 10
+    cfg["serve"]["min_shadow"] = 12
+    cfg["serve"]["min_auto_support"] = 3
+    svc.deciders["private"] = FireworksSessionDecider(
+        store, cfg, "k",
+        worker_argv_fn=lambda _m: [sys.executable, SCRIPT, "fake", "ok"])
+    dec = svc.deciders["private"]
+    try:
+        p = store.get_point("e.pt")
+        p["private_model_only"] = True
+        p["target_error"] = 0.3
+        store.put_point(p)
+        for i in range(70):
+            _add_row(svc, "abc"[i % 3])
+        _finish_smoke(svc)
+        jid = _launch_full(svc)
+        _finish_full(svc, jid)
+        assert _poll_eval(svc) == jid
+        assert svc.autopilot.join_eval(jid, timeout=60)
+        assert store.job_get(jid)["status"] == "done"
+        card = store.active_model("e.pt", "private")["card"]
+        assert card["model_ref"]
+        r = svc.do_promote({"point_id": "e.pt", "phase": "shadow"})
+        assert r["ok"], r
+        for i in range(12):
+            _add_row(svc, "abc"[i % 3])
+        ev = svc._private_evidence_rows(
+            store.get_point("e.pt"), card)
+        assert len(ev) == 12
+        assert {r["probe"]["model_version"] for r, _ in ev} == {
+            card["model_ref"]}
+        assert all(r["decider"] == "private" for r, _ in ev)
+        r = svc.do_promote({"point_id": "e.pt", "phase": "serve",
+                            "confirm": True})
+        assert r["ok"], r
+        assert store.get_point("e.pt")["phase"] == "serve"
+    finally:
+        dec.close()
+
+
+# -- Y9: spend accounting ------------------------------------------------------
+
+def test_Y9_train_ledger_includes_dev_eval(tmp_path):
+    svc, store, _ = _setup(tmp_path)
+    for i in range(70):
+        _add_row(svc, "abc"[i % 3])
+    _finish_smoke(svc)
+    dry = svc.autopilot.dry_run(store.get_point("e.pt"))
+    assert dry["estimate"]["dev_eval_usd"] > 0
+    jid = _launch_full(svc)
+    job = store.job_get(jid)
+    assert job["train_usd"] == pytest.approx(
+        dry["estimate"]["train_usd"] + dry["estimate"]["dev_eval_usd"])
+
+
+def test_Y9_free_path_counts_eval_estimate(tmp_path):
+    svc, store, _ = _setup(tmp_path)
+    for i in range(70):
+        _add_row(svc, "abc"[i % 3])
+    _finish_smoke(svc)
+    r = svc.do_train({"point_id": "e.pt", "force": True, "confirm": True,
+                      "training_free_confirmed": True})
+    assert r["ok"] and r["status"] == "running" and r["kind"] == "full", r
+    jid = r["job_id"]
+    launch = store.job_get(jid)
+    assert launch["train_usd"] == 0
+    assert launch["counted_usd"] > 0  # the eval part, not $0
+    _finish_full(svc, jid)
+    assert _poll_eval(svc) == jid
+    assert svc.autopilot.join_eval(jid, timeout=60)
+    job = store.job_get(jid)
+    assert job["status"] == "done"
+    assert job["counted_usd"] == pytest.approx(launch["counted_usd"])
+
+
+def test_Y9_eval_counts_train_commit(tmp_path):
+    svc, store, _ = _setup(tmp_path)
+    for i in range(70):
+        _add_row(svc, "abc"[i % 3])
+    sid = _finish_smoke(svc)
+    smoke_counted = store.job_get(sid)["counted_usd"]
+    jid = _launch_full(svc)
+    train = store.job_get(jid)["train_usd"]
+    assert train > 0
+    # Budget covers settled + train/2 + the first batch, but not the
+    # full train commit: without the train term the eval would proceed.
+    svc.cfg["fireworks"]["monthly_budget_usd"] = smoke_counted + train / 2
+    _finish_full(svc, jid)
+    assert _poll_eval(svc) == jid
+    assert svc.autopilot.join_eval(jid, timeout=60)
+    job = store.job_get(jid)
+    assert job["status"] == "eval_failed"
+    assert "budget_exceeded" in (job["error"] or "")
+    # Train settles (it ran); no eval call was ever scored.
+    assert store.spend_get(_month(), "fireworks")["usd"] == pytest.approx(
+        smoke_counted + train)
+
+
+def test_Y9_eval_counts_open_reservations(tmp_path):
+    svc, store, _ = _setup(tmp_path)  # budget 100
+    for i in range(70):
+        _add_row(svc, "abc"[i % 3])
+    _finish_smoke(svc)
+    jid = _launch_full(svc)
+    train = store.job_get(jid)["train_usd"]
+    settled = store.spend_get(_month(), "fireworks")["usd"]
+    # An open reservation that fits on its own, but with the train
+    # commit leaves no room for the first eval batch.
+    rid = store.hosted_reserve(_month(), "fireworks",
+                               100.0 - settled - train / 2, 100.0, 600)
+    assert rid is not None
+    _finish_full(svc, jid)
+    assert _poll_eval(svc) == jid
+    assert svc.autopilot.join_eval(jid, timeout=60)
+    job = store.job_get(jid)
+    assert job["status"] == "eval_failed"
+    assert "budget_exceeded" in (job["error"] or "")

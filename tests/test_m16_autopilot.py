@@ -115,7 +115,7 @@ def make_scripted(tmp_path, schedule, private_schedule=None, trainer=None,
     if private_schedule is not None:
         deciders["private"] = FakeDecider(
             fn=scripted_private(private_schedule), decider_tag="private",
-            model_tag="fp-1")
+            model_tag="fake-private-1")
     svc = Service(cfg, store, deciders, rng=random.Random(0), trainer=trainer,
                   monotonic=(lambda: mono["t"]) if mono is not None else None)
     return svc, store, cfg
@@ -691,6 +691,27 @@ def test_T_AP5_paid_refusals(tmp_path, clock):
     assert store.jobs_latest()["kind"] == "full"
 
 
+def test_Y14_paid_full_needs_post_smoke_reapproval(tmp_path, clock):
+    svc, store, cfg, trainer = train_setup(tmp_path, estimate_override=1.0)
+    cfg["fireworks"]["allow_paid_training"] = True
+    reapprove(cfg, store)
+    svc.autopilot_check()  # smoke launches
+    assert store.jobs_latest()["kind"] == "smoke"
+    trainer.complete(store.jobs_latest()["job_id"])
+    svc.autopilot_check()
+    assert store.jobs_latest()["status"] == "smoke_done"
+    # Paid and within limits, but no post-smoke approval: blocked.
+    assert svc.autopilot.point_status(
+        store.get_point("ap.tr")) == ("blocked(reapproval)", "reapproval")
+    assert svc.autopilot_check()["actions"] == []
+    assert len(trainer.uploaded) == 1  # smoke only
+    # Re-approving after the smoke unblocks the full job.
+    reapprove(cfg, store)
+    out = svc.autopilot_check()
+    assert [a["action"] for a in out["actions"]] == ["train_launched"]
+    assert store.jobs_latest()["kind"] == "full"
+
+
 def test_T_AP5_month_cap(tmp_path, clock):
     svc, store, cfg, trainer = train_setup(tmp_path, estimate_override=1.0)
     cfg["autopilot"]["max_monthly_jobs_usd"] = 1.0
@@ -748,7 +769,10 @@ def test_T_AP6_job_running_and_min_new_rows(tmp_path, clock):
     assert svc.autopilot.point_status(
         store.get_point("ap.tr")) == ("blocked(job_running)", "job_running")
     trainer.complete(store.jobs_latest()["job_id"])
-    svc.autopilot_check()  # smoke done -> full launches (no marker yet)
+    svc.autopilot_check()
+    assert store.jobs_latest()["status"] == "smoke_done"
+    reapprove(cfg, store)  # Y14: the full job needs a post-smoke approval
+    svc.autopilot_check()  # full launches (no marker yet)
     assert store.jobs_latest()["kind"] == "full"
     trainer.complete(store.jobs_latest()["job_id"])
     svc.autopilot_check()

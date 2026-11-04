@@ -8,7 +8,9 @@ This file is THREE things at once, so the protocol has one home:
    on the private refund pilot), loads the adapter, prints READY,
    then serves JSON-line requests ``{"id", "rows"}`` with ``{"id",
    "logprobs", "tokens_in", "seconds"}`` or ``{"id", "error"}``.
-   Live-only (needs the key, the session and the adapter).
+   Live-only (needs the key, the session and the adapter). The
+   protocol rides a dedicated pipe (Y6), never stdout: prints go to
+   the log stream, so cookbook chatter can't corrupt replies.
 2. The FAKE worker program (``fake``): the same JSON lines with a
    planted ``label_hint`` signal, scripted failures for tests. Runs on
    any python, stdlib only, fully offline.
@@ -34,15 +36,21 @@ Protocol details:
 - ``tokens_in`` is the GP12 formula (rendered json / 4, same as
   ``FireworksTrainer._row_tokens``), so estimates and settled scoring
   spend use one formula until L3 reconciles against the bill.
-- READY: the worker's first stdout line, after the adapter loads. The
-  client waits up to ``decider.timeout_s`` (wall time) at spawn, then
-  reports ``warming`` until READY arrives. Earlier stdout lines (recipe
-  chatter) are forwarded to the worker log.
+- READY: the worker's first protocol line, after the adapter loads.
+  The client waits up to ``decider.timeout_s`` (wall time) at spawn,
+  then reports ``warming`` until READY arrives. Prints (recipe
+  chatter) travel the log stream, never the protocol pipe.
 - Idle: the worker exits 0 after ``idle_s`` without a request, which
   closes the serverless session; the client restarts lazily without
   counting it as a failure. Any other death, a timeout or a protocol
   violation counts as a failure: the next spawn is a restart, throttled
   to one per 10 minutes (``restart_throttled`` until the window ends).
+- Topology (Z6): the MCP server and the gateway are separate processes
+  with separate session deciders, so concurrent private traffic in both
+  holds two serverless sessions. Spawns are lazy (first scored call)
+  and idle workers exit after ``worker_idle_min``, which bounds the
+  overlap; sharing one session across processes would need a worker
+  socket server, which is a bigger change than this item.
 """
 from __future__ import annotations
 
@@ -63,6 +71,11 @@ RESTART_WINDOW_S = 600.0
 #: account id, so like the key it travels in the environment, never argv).
 MODEL_REF_ENV = "DECIDEONCE_MODEL_REF"
 
+#: env var carrying the protocol pipe's fd number into the worker (Y6:
+#: the JSON-lines protocol rides a dedicated pipe, never stdout, so
+#: cookbook prints can't corrupt it and buffered reads can't hide it).
+PROTO_FD_ENV = "DECIDEONCE_PROTO_FD"
+
 _FW_KEY_RE = re.compile(r"fw_[A-Za-z0-9]{8,}")
 
 
@@ -72,6 +85,17 @@ def _mask_log_line(line: str) -> str:
     from .trainer_log import redact_account
 
     return redact_account(_FW_KEY_RE.sub("fw_***", line))
+
+
+def _proto_fd():
+    """The protocol sink (Y6): the parent's dedicated pipe, or None
+    when the worker wasn't spawned by a session (never stdout: the
+    protocol must not share a fd with prints)."""
+    try:
+        return os.fdopen(int(os.environ.get(PROTO_FD_ENV, "")), "w",
+                         buffering=1)
+    except (ValueError, OSError):
+        return None
 #: Forward chunk, as option_logprobs' default.
 CHUNK = 64
 
@@ -171,6 +195,8 @@ class WorkerSession:
         self._log_lock = threading.Lock()
         self._err_pumps: list[threading.Thread] = []
         self._proc: subprocess.Popen | None = None
+        self._proto_r: int | None = None
+        self._proto_buf = bytearray()
         self._last_rc: int | None = None
         self._ready = False
         self._closed = False
@@ -215,17 +241,29 @@ class WorkerSession:
         if needs_key and not self.key:
             raise WorkerUnavailable("spawn_failed", "no fireworks key")
         self._open_log()
+        # Y6: the protocol rides a dedicated pipe (never stdout, so
+        # cookbook prints can't corrupt it). The fd number travels in
+        # the environment; our write end closes right after the spawn
+        # (else the read end never sees EOF when the child dies).
+        proto_r, proto_w = os.pipe()
         env = dict(os.environ)
+        env[PROTO_FD_ENV] = str(proto_w)
         if needs_key:
             env["FIREWORKS_API_KEY"] = self.key
             env[MODEL_REF_ENV] = self.model
         try:
             self._proc = subprocess.Popen(
                 argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                pass_fds=(proto_w,),
                 start_new_session=True, text=True, bufsize=1)
         except OSError as e:
+            os.close(proto_r)
+            os.close(proto_w)
             raise WorkerUnavailable("spawn_failed", str(e))
+        os.close(proto_w)
+        self._proto_r = proto_r
+        self._proto_buf = bytearray()
         pump = threading.Thread(target=self._pump_stderr,
                                 args=(self._proc,), daemon=True)
         pump.start()
@@ -235,11 +273,9 @@ class WorkerSession:
         # start keeps going in the background and reads as warming.
         deadline = time.monotonic() + self.timeout_s
         while True:
-            wait = max(0.0, deadline - time.monotonic())
-            ready, _, _ = select.select([self._proc.stdout], [], [], wait)
-            if not ready:
+            line = self._proto_readline(max(0.0, deadline - time.monotonic()))
+            if line is None:
                 return
-            line = self._proc.stdout.readline()
             if line == "":
                 self._reap()
                 raise WorkerUnavailable("worker_died",
@@ -251,8 +287,42 @@ class WorkerSession:
                 self._log.write(_mask_log_line(f"[early] {line}"))
                 self._log.flush()
 
+    def _proto_readline(self, timeout: float) -> str | None:
+        """One protocol line (Y6): unbuffered os.read under select.
+
+        Returns "" on EOF, None on timeout. Buffered readline() is
+        banned here: its readahead hides data from select, which reads
+        a ready worker as warming forever.
+        """
+        buf = self._proto_buf
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            nl = buf.find(b"\n")
+            if nl >= 0:
+                line = bytes(buf[:nl + 1])
+                del buf[:nl + 1]
+                return line.decode("utf-8", "replace")
+            wait = max(0.0, deadline - time.monotonic())
+            ready, _, _ = select.select([self._proto_r], [], [], wait)
+            if not ready:
+                return None
+            try:
+                chunk = os.read(self._proto_r, 65536)
+            except OSError:
+                return ""
+            if not chunk:
+                return ""
+            buf += chunk
+
     def _reap(self) -> int | None:
         proc, self._proc = self._proc, None
+        if self._proto_r is not None:
+            try:
+                os.close(self._proto_r)
+            except OSError:
+                pass
+            self._proto_r = None
+        self._proto_buf = bytearray()
         if proc is None:
             return self._last_rc
         try:
@@ -291,18 +361,22 @@ class WorkerSession:
         if self._last_rc is not None:
             # Account the reaped exit once: non-zero is a failure, so
             # this spawn is a throttled restart; 0 is an idle exit.
-            rc, self._last_rc = self._last_rc, None
+            # Y7: clear only after the throttle check passes. Clearing
+            # first lets a throttled call forget the death, so the
+            # next call respawns inside the window instead of waiting.
+            rc = self._last_rc
             if rc != 0:
                 self._note_restart_or_raise()
+            self._last_rc = None
         self._spawn()
 
     def _poll_ready(self) -> bool:
-        """Consume stdout until READY (True), EOF (raises) or dry (False)."""
+        """Consume the protocol pipe until READY (True), EOF (raises)
+        or dry (False)."""
         while True:
-            ready, _, _ = select.select([self._proc.stdout], [], [], 0)
-            if not ready:
+            line = self._proto_readline(0)
+            if line is None:
                 return False
-            line = self._proc.stdout.readline()
             if line == "":
                 self._reap()
                 raise WorkerUnavailable("worker_died",
@@ -315,12 +389,16 @@ class WorkerSession:
                 self._log.flush()
 
     # -- protocol ------------------------------------------------------------
-    def score(self, rows: list[dict]) -> dict:
+    def score(self, rows: list[dict], timeout_s: float | None = None) -> dict:
         """Score rows: {logprobs, tokens_in, seconds}.
 
         Raises WorkerError (worker refused) or WorkerUnavailable
-        (retry later; F7 maps these to teacher mode).
+        (retry later; F7 maps these to teacher mode). Y5: callers
+        pass their own timeout (eval batches need far more than the
+        3 s serve default); None keeps it.
         """
+        if timeout_s is None:
+            timeout_s = self.timeout_s
         with self._lock:
             if self._closed:
                 raise WorkerUnavailable("closed", "session closed")
@@ -335,17 +413,15 @@ class WorkerSession:
             except (BrokenPipeError, ValueError):
                 self._reap()
                 raise WorkerUnavailable("worker_died", "stdin broken")
-            ready, _, _ = select.select([self._proc.stdout], [], [],
-                                        self.timeout_s)
-            if not ready:
+            line = self._proto_readline(timeout_s)
+            if line is None:
                 self._kill()
                 self._reap()
                 raise WorkerUnavailable("timeout",
-                                        f"no reply in {self.timeout_s}s")
-            line = self._proc.stdout.readline()
+                                        f"no reply in {timeout_s}s")
             if line == "":
                 self._reap()
-                raise WorkerUnavailable("worker_died", "stdout EOF")
+                raise WorkerUnavailable("worker_died", "protocol EOF")
             try:
                 resp = json.loads(line)
             except ValueError:
@@ -399,11 +475,12 @@ class WorkerSession:
 
 # -- real worker program (live-only; runs in the cookbook venv) ----------------
 
-def _serve_loop(handle, idle_s: float) -> int:
+def _serve_loop(handle, idle_s: float, out) -> int:
     """Serve stdin until EOF or (idle_s > 0) an idle gap (0).
 
     ``handle`` maps rows -> logprobs; rows are dummy-labelled first
-    (the cookbook skips unlabelled questions).
+    (the cookbook skips unlabelled questions). ``out`` is the Y6
+    protocol sink (never stdout: prints would corrupt the stream).
     """
     while True:
         if idle_s > 0:
@@ -423,9 +500,9 @@ def _serve_loop(handle, idle_s: float) -> int:
                 raise ValueError("rows must be a list")
         except (ValueError, KeyError, AttributeError) as e:
             rid = req.get("id") if isinstance(req, dict) else None
-            sys.stdout.write(json.dumps(
+            out.write(json.dumps(
                 {"id": rid, "error": f"bad request: {e}"}) + "\n")
-            sys.stdout.flush()
+            out.flush()
             continue
         t0 = time.time()
         try:
@@ -436,8 +513,8 @@ def _serve_loop(handle, idle_s: float) -> int:
         except Exception as e:  # noqa: BLE001 - reported, worker survives
             resp = {"id": req.get("id"),
                     "error": f"{type(e).__name__}: {e}"}
-        sys.stdout.write(json.dumps(resp) + "\n")
-        sys.stdout.flush()
+        out.write(json.dumps(resp) + "\n")
+        out.flush()
 
 
 def real_main(argv: list[str]) -> int:
@@ -482,8 +559,12 @@ def real_main(argv: list[str]) -> int:
             additional_headers=read_api_extra_headers_env(), stack=stack,
             close_session_on_exit=True)
     client.load_adapter(model)
-    sys.stdout.write("READY\n")
-    sys.stdout.flush()
+    proto = _proto_fd()
+    if proto is None:
+        sys.stderr.write(f"worker: {PROTO_FD_ENV} is not set\n")
+        return 1
+    proto.write("READY\n")
+    proto.flush()
 
     def handle(rows: list[dict]) -> list[list[float]]:
         datums = []
@@ -508,7 +589,7 @@ def real_main(argv: list[str]) -> int:
                 for q, lp in zip(owners, rows_out)]
 
     with stack:
-        return _serve_loop(handle, idle_s)
+        return _serve_loop(handle, idle_s, proto)
 
 
 # -- fake worker program (offline; any python) -----------------------------------
@@ -534,14 +615,16 @@ def _fake_logprobs(rows: list[dict]) -> list[list[float]]:
 def fake_main(argv: list[str]) -> int:
     """fake <mode> [param]: ok [delay] | error [msg] | slow <s> |
     die-after <n> | idle <s> | mute [s] | error-after <n>. Same JSON
-    lines as serve; mute never prints READY (warming tests)."""
+    lines as serve, on the same protocol pipe (stdout when hand-run
+    without a session); mute never prints READY (warming tests)."""
     mode = argv[0] if argv else "ok"
     param = argv[1] if len(argv) > 1 else ""
     if mode == "mute":
         time.sleep(float(param or 30))
         return 0
-    sys.stdout.write("READY\n")
-    sys.stdout.flush()
+    out = _proto_fd() or sys.stdout
+    out.write("READY\n")
+    out.flush()
     served = 0
     idle_s = float(param) if mode == "idle" else 0.0
     delay = 0.0
@@ -564,9 +647,9 @@ def fake_main(argv: list[str]) -> int:
             rows = req["rows"]
         except (ValueError, KeyError, AttributeError) as e:
             rid = req.get("id") if isinstance(req, dict) else None
-            sys.stdout.write(json.dumps(
+            out.write(json.dumps(
                 {"id": rid, "error": f"bad request: {e}"}) + "\n")
-            sys.stdout.flush()
+            out.flush()
             continue
         if mode == "error":
             resp = {"id": req.get("id"), "error": param or "fake boom"}
@@ -583,11 +666,14 @@ def fake_main(argv: list[str]) -> int:
             resp = {"id": req.get("id"), "logprobs": _fake_logprobs(rows),
                     "tokens_in": tokens_of(rows),
                     "seconds": time.time() - t0}
-        sys.stdout.write(json.dumps(resp) + "\n")
-        sys.stdout.flush()
+        out.write(json.dumps(resp) + "\n")
+        out.flush()
 
 
 def main(argv: list[str]) -> int:
+    # Y6: prints (ours, the cookbook's, the interpreter's) go to the
+    # log stream; only the JSON-lines protocol uses the pipe.
+    os.dup2(2, 1)
     if not argv or argv[0] not in ("serve", "fake"):
         sys.stderr.write("usage: fireworks_worker.py serve|fake ...\n")
         return 2

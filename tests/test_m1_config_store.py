@@ -172,3 +172,89 @@ def test_fakedecider_scripted_failure_propagates():
     d = FakeDecider(fn=boom)
     with pytest.raises(DeciderError):
         d.decide([_req("a")])
+
+
+# -- Y4: every connection touchpoint under _locked -------------------------------
+
+def test_Y4_concurrent_job_ops_safe(tmp_path):
+    import threading
+
+    store = Store(tmp_path / "r")
+    month = "2026-11"
+    errors: list = []
+
+    def worker(n):
+        try:
+            for i in range(20):
+                jid = f"y4-{n}-{i:02d}"
+                store.job_put({
+                    "job_id": jid, "kind": "smoke", "status": "failed",
+                    "points": [], "created_at": "2026-11-04T00:00:00Z"})
+                store.job_update(jid, {"counted_usd": 1.0})
+                assert store.job_get(jid)["counted_usd"] == 1.0
+                store.job_by_idem("no-such-idem")
+                store.jobs_running()
+                store.jobs_evaluating()
+                store.spend_add(month, "fireworks", 0.01)
+                store.spend_get(month, "fireworks")
+                assert store.job_mark_cancelled(jid, 1.0, None) is False
+                assert store.job_get(jid)["status"] == "failed"
+        except Exception as e:  # noqa: BLE001 - collected, asserted below
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    assert not [t for t in threads if t.is_alive()]
+    assert errors == []
+    assert store.spend_get(month, "fireworks")["usd"] == \
+        pytest.approx(8 * 20 * 0.01)
+
+
+def test_Z7_notify_threads_pruned(tmp_path):
+    from decideonce import autopilot as AP
+
+    for _ in range(3):
+        AP.notify("true", "hello")
+    with AP._notify_lock():
+        first = list(AP._NOTIFY_THREADS)
+    for t in first:
+        t.join(timeout=5)
+    AP.notify("true", "hello")
+    with AP._notify_lock():
+        assert len(AP._NOTIFY_THREADS) <= 2
+    AP.sync_notifies()
+    with AP._notify_lock():
+        assert AP._NOTIFY_THREADS == []
+
+
+def test_Z7_cas_checks_flags_and_cooldown(tmp_path):
+    store = Store(tmp_path / "proj")
+    try:
+        store.put_point({"point_id": "z7.cas", "workflow": "w",
+                         "kind": "choice", "phase": "shadow",
+                         "point_version": 1})
+        cas = store.cas_point_phase
+        assert cas("z7.cas", "shadow", 1, False, "serve")["phase"] == "serve"
+        p = store.get_point("z7.cas")
+        p["phase"] = "shadow"
+        p["suspected"] = True  # concurrent flag flip: CAS must lose
+        store.put_point(p)
+        assert cas("z7.cas", "shadow", 1, False, "serve",
+                   False, False, None) is None
+        p["suspected"] = False
+        p["irreversible"] = True
+        store.put_point(p)
+        assert cas("z7.cas", "shadow", 1, False, "serve",
+                   False, False, None) is None
+        p["irreversible"] = False
+        p["autopilot_demotion_ts"] = "2026-01-01T00:00:00Z"
+        store.put_point(p)
+        assert cas("z7.cas", "shadow", 1, False, "serve",
+                   False, False, None) is None
+        assert cas("z7.cas", "shadow", 1, False, "serve", False, False,
+                   "2026-01-01T00:00:00Z")["phase"] == "serve"
+    finally:
+        store.close()

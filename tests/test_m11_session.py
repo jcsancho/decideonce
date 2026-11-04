@@ -168,7 +168,10 @@ def test_T_PT8_timeout_counted_private(tmp_path):
         assert "jev_unavailable" in r["warnings"]
         assert store.counter_get("private_error_timeout", "s.pt") == 1
         assert store.counter_get("hosted_error_timeout", "s.pt") == 0
-        assert store.spend_open(_month(), "fireworks")["n"] == 1  # kept: R2-8
+        # Y9: a timed-out call settles its reservation (G5), not the reaper.
+        assert store.spend_open(_month(), "fireworks")["n"] == 0
+        got = store.spend_get(_month(), "fireworks")
+        assert got["usd"] == pytest.approx(0.005) and got["calls"] == 1
     finally:
         dec.close()
 
@@ -218,5 +221,17 @@ def test_T_PT8_bad_temperature_falls_back(tmp_path):
                               "job_id": "j9"})
             res = dec.decide([_req()])[0]
             assert res.probs["a"] == pytest.approx(want[0]), bad
+    finally:
+        dec.close()
+
+
+def test_Y5_decide_passes_timeout_through(tmp_path):
+    svc, _, _ = _setup(tmp_path, fake_args=("slow", "1"))
+    dec = svc.deciders["private"]
+    try:
+        with pytest.raises(DeciderError, match="timeout"):
+            dec.decide([_req()], timeout_s=0.2)
+        res = dec.decide([_req()], timeout_s=30)[0]
+        assert res.probs["a"] > 0.9
     finally:
         dec.close()

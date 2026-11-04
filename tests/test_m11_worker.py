@@ -217,12 +217,74 @@ def test_X3_spawn_argv_carries_no_model(tmp_path):
         s.close()
 
 
+def test_Y5_score_honors_caller_timeout(tmp_path):
+    with _sess(tmp_path, "slow", "1") as s:
+        rows = [_srow("a")]
+        with pytest.raises(WorkerUnavailable, match="timeout"):
+            s.score(rows, 0.2)
+        out = s.score(rows, 30)
+        assert len(out["logprobs"]) == 1
+
+
+def test_Y7_throttle_state_survives_raise(tmp_path):
+    with _sess(tmp_path, "ok") as s:
+        rows = [_srow("a")]
+        s.score(rows)  # spawn #1 ok
+        s._proc.kill()
+        s._proc.wait()
+        s.score(rows)  # death #1: restart noted, spawn #2 ok
+        s._proc.kill()
+        s._proc.wait()
+        with pytest.raises(WorkerUnavailable, match="restart_throttled"):
+            s.score(rows)  # death #2 inside the window: throttled...
+        with pytest.raises(WorkerUnavailable, match="restart_throttled"):
+            s.score(rows)  # ... and stays throttled (Y7)
+
+
+def test_Y6_prints_cannot_break_protocol(tmp_path):
+    from decideonce.fireworks_worker import WorkerSession
+
+    cfg = _wcfg(tmp_path)
+    script = ("import json, os, sys\n"
+              "print('stdout noise mid-run', flush=True)\n"
+              "sys.stderr.write('cookbook chatter here\\n'); "
+              "sys.stderr.flush()\n"
+              "proto = os.fdopen(int(os.environ['DECIDEONCE_PROTO_FD']), "
+              "'w', buffering=1)\n"
+              "proto.write('READY\\n'); proto.flush()\n"
+              "for line in sys.stdin:\n"
+              "    line = line.strip()\n"
+              "    if not line:\n"
+              "        continue\n"
+              "    req = json.loads(line)\n"
+              "    print('mid-call stdout noise', flush=True)\n"
+              "    n = len(req['rows'])\n"
+              "    proto.write(json.dumps({'id': req.get('id'), "
+              "'logprobs': [[0.0, 0.0]] * n, 'tokens_in': 10, "
+              "'seconds': 0.0}) + '\\n'); proto.flush()\n")
+    argv = [sys.executable, "-c", script]
+    with WorkerSession(cfg, "accounts/acct-test/models/dk-t-0001",
+                       tmp_path / "jobs", key="k",
+                       worker_argv=argv) as s:
+        out = s.score([_srow("a"), _srow("b")])
+        assert len(out["logprobs"]) == 2
+        log = s.dir / "worker.log"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if "cookbook chatter here" in log.read_text():
+                break
+            time.sleep(0.1)
+        assert "cookbook chatter here" in log.read_text()
+
+
 def test_X3_worker_log_0600_and_masked(tmp_path):
     from decideonce.fireworks_worker import WorkerSession
 
     cfg = _wcfg(tmp_path)
-    script = ("import sys, time\n"
-              "sys.stdout.write('READY\\n'); sys.stdout.flush()\n"
+    script = ("import os, sys, time\n"
+              "proto = os.fdopen(int(os.environ['DECIDEONCE_PROTO_FD']), "
+              "'w', buffering=1)\n"
+              "proto.write('READY\\n'); proto.flush()\n"
               "sys.stderr.write('leaked fw_abcdefgh12345678 and '\n"
               "  'accounts/someuser-1a2b3c/models/m\\n'); sys.stderr.flush()\n"
               "time.sleep(30)\n")

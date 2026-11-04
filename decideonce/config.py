@@ -56,6 +56,7 @@ DEFAULTS: dict = {
         "job_max_hours": 3,
         "worker_idle_min": 30,
         "eval_ready_s": 600,
+        "eval_timeout_s": 600,
         "score_price_per_mtok": 1.96,
         "reserve_usd": 0.005,
         "allow_session_serving": False,

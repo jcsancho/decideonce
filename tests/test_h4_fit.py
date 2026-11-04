@@ -348,6 +348,25 @@ def test_T_HB11_threshold_fit_rows_only(tmp_path, clock):
         fit["id"], fit["threshold"], fit["fitted_at"])
 
 
+def test_T_T7_recall_below_threshold_is_teacher_only(tmp_path, clock):
+    def sched(i, hint, opts):
+        # hosted always answers "a": perfect on a-rows, wrong on b-rows.
+        return "a", 0.9
+
+    svc, store, cfg = make_custom(tmp_path, _deterministic_fn(sched),
+                                  fit_rows=20)
+    assert svc.do_register(point())["ok"]
+    assert svc.do_promote({"point_id": "h4.pt", "phase": "shadow"})["ok"]
+    for i in range(10):
+        decide_label(svc, "a")
+    for i in range(10):
+        decide_label(svc, "b")
+    fit = store.active_hosted_fit("h4.pt")
+    assert fit["per_option"]["b"]["n"] == 10  # support is fine; recall is not
+    assert fit["per_option"]["b"]["recall"] == 0.0
+    assert fit["teacher_only_options"] == ["b"]
+
+
 # -- hosted serve -----------------------------------------------------------
 
 

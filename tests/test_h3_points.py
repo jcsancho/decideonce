@@ -53,6 +53,16 @@ def test_T_HB6_policy_bump_resets_plan_phase_and_epoch(tmp_path):
     assert p2["fit_epoch_start"] > "2020-01-01T00:00:00Z"
 
 
+def test_Z7_reregister_without_policy_keeps_it(tmp_path):
+    svc, store, _ = make_tiered(tmp_path)
+    assert svc.do_register(point(policy="v1 rules"))["ok"]
+    assert store.get_point("h3.pt")["point_version"] == 1
+    assert svc.do_register(point())["ok"]  # policy omitted: not a removal
+    p = store.get_point("h3.pt")
+    assert p["policy"] == "v1 rules"
+    assert p["point_version"] == 1
+
+
 def test_T_HB6_policy_first_state_key(tmp_path):
     svc, store, _ = make_tiered(tmp_path)
     assert svc.do_register(point(policy="refund rules: be kind"))["ok"]

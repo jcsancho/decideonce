@@ -209,6 +209,82 @@ def test_X3_job_jsonl_0600(tmp_path):
         assert mode == 0o600, (name, oct(mode))
 
 
+# -- Y1/Y2: idem validation + reuse --------------------------------------------
+
+def test_Y1_launch_rejects_bad_idem(tmp_path):
+    tr, _, jobs, _ = _trainer(tmp_path)
+    rows = [_row(split="train")]
+    for bad in ("../../evil-traversal", "short", "has space here!!",
+                "", "ok-but-way-too-long-" + "x" * 60):
+        with pytest.raises(ValueError, match="bad idem"):
+            tr.launch(rows, "smoke", bad)
+    assert not jobs.exists() or list(jobs.iterdir()) == []
+    assert not (tmp_path / "evil-traversal").exists()
+
+
+def test_Y1_job_dir_rejects_traversal(tmp_path):
+    tr, _, _, _ = _trainer(tmp_path)
+    with pytest.raises(ValueError, match="bad job_id"):
+        tr.status("../../evil-12345678")
+    with pytest.raises(ValueError, match="bad job_id"):
+        tr.cancel("x")
+
+
+def test_Y2_trainer_refuses_existing_dir(tmp_path):
+    from decideonce.trainer import IdemInUse
+
+    tr, _, jobs, _ = _trainer(tmp_path)
+    rows = [_row(split="train")]
+    tr.launch(rows, "smoke", "idem-reuse-dir")
+    with pytest.raises(IdemInUse):
+        tr.launch(rows, "smoke", "idem-reuse-dir")
+    assert [p.name for p in jobs.iterdir()] == ["idem-reuse-dir"]
+
+
+def test_Y8_cancel_skips_reused_pid(tmp_path):
+    import subprocess as _sp
+    import time as _t
+
+    from decideonce.fireworks_trainer import FireworksTrainer
+
+    cfg = _cfg(tmp_path)
+    jobs = tmp_path / "jobs"
+    tr = FireworksTrainer(cfg, jobs, key="k", runner=_Runner())
+    victim = _sp.Popen(["sleep", "60"])
+    try:
+        jd = jobs / "idem-reused-pid"
+        jd.mkdir(parents=True)
+        (jd / "meta.json").write_text('{"kind": "smoke"}')
+        (jd / "pid").write_text(f"{victim.pid}\n")
+        (jd / "started_at").write_text(f"{int(_t.time()) - 3600}\n")
+        out = tr.cancel("idem-reused-pid")
+        assert out["status"] == "cancelled"
+        assert victim.poll() is None  # the stranger survives
+        assert (jd / "cancelled").is_file()
+        assert (jd / "exit_code").read_text().strip() == "125"
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def test_Y8_status_files_atomic(tmp_path):
+    from decideonce.fireworks_trainer import RUN_SH
+
+    assert "mv -f" in RUN_SH
+    tr, jobs = _live_trainer(tmp_path, "smoke-ok", name="atomic")
+    job_id = tr.launch(_rows(), "smoke", "idem-atomic")
+    try:
+        assert _poll(tr, job_id)["status"] == "done"
+        names = {p.name for p in (jobs / job_id).iterdir()}
+        assert not [n for n in names if n.endswith(".tmp")]
+        assert names >= {"pid", "started_at", "exit_code", "finished_at",
+                         "train.log"}
+        int((jobs / job_id / "pid").read_text().strip())
+        int((jobs / job_id / "exit_code").read_text().strip())
+    finally:
+        tr.cancel(job_id)
+
+
 # -- estimate (GP12) ----------------------------------------------------------
 
 def _toks(row):
@@ -252,6 +328,20 @@ def test_F1_estimate_empty_is_zero(tmp_path):
     assert est["estimate_usd"] == 0.0 and est["train_rows"] == 0
 
 
+def test_Y9_estimate_splits_dev_eval(tmp_path):
+    tr, _, _, _ = _trainer(tmp_path)
+    rows = ([_row(split="train", label="ab"[i % 2]) for i in range(10)]
+            + [_row(split="calib") for _ in range(4)]
+            + [_row(split="heldout") for _ in range(6)])
+    est = tr.estimate(rows, "full")
+    dev_toks = sum(_toks(r) for r in rows if r["split"] == "calib")
+    assert est["dev_eval_usd"] == 3 * dev_toks * 1.96 / 1e6
+    assert est["dev_eval_usd"] < est["eval_usd"]  # post-job part on top
+    smoke = tr.estimate(rows, "smoke")
+    assert smoke["dev_eval_usd"] == smoke["eval_usd"]  # in-job dev only
+    assert tr.estimate([], "full")["dev_eval_usd"] == 0.0
+
+
 # -- T-PT3: log parser on redacted pilot fixtures ------------------------------
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -290,6 +380,47 @@ def test_T_PT3_full_log(tmp_path):
     assert out["n_train"] == 150
 
 
+def test_Y12_bare_model_line_ignored(tmp_path):
+    from decideonce.trainer_log import parse_log
+
+    out = parse_log(
+        "echo --output-model-id dk-real\n"
+        "debug: resolved -> model 'accounts/x/models/evil'\n"
+        "Promoting session checkpoint 'c' -> model "
+        "'accounts/acct-test/models/dk-real'\n"
+        "Promoted!\n")
+    assert out["model"] == "accounts/acct-test/models/dk-real"
+    assert out["promoted"] is True
+    out = parse_log("note -> model 'accounts/x/models/evil'\n")
+    assert out["model"] is None
+
+
+def test_Y12_promotion_must_match_meta(tmp_path):
+    tr, _, jobs, _ = _trainer(tmp_path)
+    jd = jobs / "jd1-y12-0001"
+    jd.mkdir(parents=True)
+    (jd / "meta.json").write_text(json.dumps(
+        {"kind": "full",
+         "argv": ["recipe", "--output-model-id", "dk-real-0001"]}))
+    (jd / "train.log").write_text(
+        "Promoting session checkpoint 'c' -> model "
+        "'accounts/acct-test/models/dk-evil-0002'\n"
+        "Promoted!\n")
+    (jd / "exit_code").write_text("0")
+    st = tr.status("jd1-y12-0001")
+    assert st["status"] == "failed", st
+    assert "model_mismatch" in st["error"]
+    assert "acct-test" not in st["error"]  # tails only
+    # The same log with the requested id confirms done.
+    (jd / "train.log").write_text(
+        "Promoting session checkpoint 'c' -> model "
+        "'accounts/acct-test/models/dk-real-0001'\n"
+        "Promoted!\n")
+    st = tr.status("jd1-y12-0001")
+    assert st["status"] == "done", st
+    assert st["model"] == "accounts/acct-test/models/dk-real-0001"
+
+
 def test_T_PT3_malformed_input_never_raises():
     from decideonce.trainer_log import parse_log
 
@@ -302,19 +433,37 @@ def test_T_PT3_malformed_input_never_raises():
     assert out["account_id"] is None and out["n_train"] is None
 
 
+def test_Y13_missing_cookbook_reason(tmp_path):
+    from decideonce.store import Store
+    from decideonce.trainer import live_trainer_unavailable_reason
+
+    cfg = _cfg(tmp_path)
+    cfg["fireworks"]["cookbook_dir"] = str(tmp_path / "nope")
+    store = Store(tmp_path / "proj")
+    try:
+        assert live_trainer_unavailable_reason(
+            cfg, store, "k") == "cookbook_missing"
+    finally:
+        store.close()
+
+
 # -- T-PT4: detached lifecycle with a fake child script -------------------------
 
 import sys as _sys
 import time as _time
 
 CHILD = '''
-import sys, time
+import os, sys, time
 mode = sys.argv[1]
 if mode == "smoke-ok":
     print("Sampler checkpoint 's-cal' saved (1.0s)", flush=True)
+elif mode == "pwd-ok":
+    print(os.getcwd(), flush=True)
+    print("Sampler checkpoint 's-cal' saved (1.0s)", flush=True)
 elif mode == "full-ok":
-    print("Promoting session checkpoint 'x' -> model 'accounts/a/models/m'",
-          flush=True)
+    _mid = sys.argv[sys.argv.index("--output-model-id") + 1]
+    print("Promoting session checkpoint 'x' -> model "
+          f"'accounts/a/models/{_mid}'", flush=True)
     print("Promoted! Model state=READY, kind=HF_PEFT_ADDON", flush=True)
 elif mode == "slow-ok":
     time.sleep(3)
@@ -403,6 +552,36 @@ def test_T_PT4_done_full_and_failed_and_bare(tmp_path):
     finally:
         if job3:
             tr3.cancel(job3)
+
+
+def test_Z6_recipe_runs_at_cookbook_root(tmp_path):
+    tr, jobs = _live_trainer(tmp_path, "pwd-ok", name="z6cwd")
+    job_id = tr.launch(_rows(), "smoke", "idem-z6-cwd")
+    try:
+        assert _poll(tr, job_id)["status"] == "done"
+        log = (jobs / job_id / "train.log").read_text().splitlines()
+        assert log[0] == str(tr._cookbook())
+        assert (jobs / job_id / "pid").is_file()  # markers stay in the job dir
+    finally:
+        tr.cancel(job_id)
+
+
+def test_X5_no_pid_gone_race_on_fast_exit(tmp_path):
+    # X5: status() once reported "pid gone with no exit_code" when run.sh
+    # finished between its exit check and its pid check. Hammer fast
+    # failures with tight polls: the error must always be the real one.
+    for i in range(25):
+        tr, _ = _live_trainer(tmp_path, "fail", name=f"x5-{i}")
+        job_id = tr.launch(_rows(), "smoke", f"idem-x5-{i:02d}")
+        try:
+            for _ in range(500):
+                st = tr.status(job_id)
+                if st["status"] != "running":
+                    break
+            assert st["status"] == "failed", st
+            assert "boom" in st["error"], st
+        finally:
+            tr.cancel(job_id)
 
 
 def test_T_PT4_restart_sees_same_state(tmp_path):
@@ -580,6 +759,30 @@ def test_T_PT5_same_idem_launches_once(tmp_path):
     assert len(svc.trainer.uploaded) == 1
 
 
+def test_Y11_join_needs_reason_pmo_or_force(tmp_path):
+    svc, store = _svc4(tmp_path)
+    trig = _point4("pt4")
+    trig["private_model_only"] = True
+    assert svc.do_register(trig)["ok"]
+    pj1 = _point4("pj1")
+    pj1["private_model_only"] = True
+    assert svc.do_register(pj1)["ok"]
+    assert svc.do_register(_point4("pj2"))["ok"]  # plain, hosted-served
+    _label_rows4(svc, "pt4")
+    _label_rows4(svc, "pj1")
+    _label_rows4(svc, "pj2")
+    dry = svc.autopilot.dry_run(store.get_point("pt4"))
+    marks = {j["point_id"]: j["join_ok"] for j in dry["joins"]}
+    assert marks == {"pt4": True, "pj1": True, "pj2": False}
+    forced = svc.autopilot.dry_run(store.get_point("pt4"), force=True)
+    assert {j["point_id"] for j in forced["joins"] if j["join_ok"]} == {
+        "pt4", "pj1", "pj2"}
+    r = svc.do_train({"point_id": "pt4", "confirm": True})
+    assert r["ok"] and r["status"] == "running", r
+    assert {row["point_id"] for row in svc.trainer.uploaded[-1]["rows"]} == {
+        "pt4", "pj1"}
+
+
 def test_T_PT5_failing_trainer_backoff(tmp_path):
     import types as _t
 
@@ -594,6 +797,27 @@ def test_T_PT5_failing_trainer_backoff(tmp_path):
 
     svc.trainer = _t.SimpleNamespace(status=boom)
     assert svc.autopilot.poll_and_finalize() == []
+    assert svc.autopilot.poll_and_finalize() == []
+    out = svc.autopilot.poll_and_finalize()
+    assert out[0]["action"] == "train_failed"
+    assert store.job_get(r["job_id"])["error"] == "trainer unreachable (3 polls)"
+
+
+def test_Z7_keyerror_backs_off_like_other_errors(tmp_path):
+    import types as _t
+
+    svc, store = _svc4(tmp_path)
+    assert svc.do_register(_point4())["ok"]
+    _label_rows4(svc, "pt4")
+    r = svc.do_train({"point_id": "pt4", "force": True, "confirm": True})
+    assert r["status"] == "running"
+
+    def bug(job_id):
+        raise KeyError("internal oops")
+
+    svc.trainer = _t.SimpleNamespace(status=bug)
+    assert svc.autopilot.poll_and_finalize() == []
+    assert store.job_get(r["job_id"])["status"] == "running"
     assert svc.autopilot.poll_and_finalize() == []
     out = svc.autopilot.poll_and_finalize()
     assert out[0]["action"] == "train_failed"
@@ -639,6 +863,61 @@ def test_T_PT5_launching_status_stale_and_launcher(tmp_path):
         "launching", True, "manual")
 
 
+def test_Y9_stale_empty_launching_fails_with_estimate(tmp_path):
+    import time as _time
+
+    svc, store = _svc4(tmp_path)
+    assert svc.do_register(_point4())["ok"]
+    row = _launching_row("idem-stale-empty", "2026-01-01T00:00:00Z")
+    store.job_insert_launching(row)
+    out = svc.autopilot.poll_and_finalize()
+    assert [a["action"] for a in out] == ["train_failed"]
+    job = store.job_get(row["job_id"])
+    assert job["status"] == "failed"
+    assert job["error"] == "crashed during launch"
+    month = _time.strftime("%Y-%m", _time.gmtime())
+    assert store.spend_get(month, "fireworks")["usd"] == pytest.approx(0.01)
+    assert job["spend_usd"] == pytest.approx(0.01)
+
+
+def test_Y9_stale_ran_failed_keeps_error_and_spend(tmp_path):
+    import time as _time
+
+    svc, store = _svc4(tmp_path)
+    assert svc.do_register(_point4())["ok"]
+    svc.trainer.jobs["idem-stale-failed"] = {
+        "status": "failed", "kind": "smoke", "error": "recipe boom"}
+    row = _launching_row("idem-stale-failed", "2026-01-01T00:00:00Z")
+    store.job_insert_launching(row)
+    out = svc.autopilot.poll_and_finalize()
+    assert [a["action"] for a in out] == ["train_failed"]
+    job = store.job_get(row["job_id"])
+    assert job["status"] == "failed"
+    assert job["error"] == "recipe boom"
+    month = _time.strftime("%Y-%m", _time.gmtime())
+    assert store.spend_get(month, "fireworks")["usd"] == pytest.approx(0.01)
+
+
+def test_Y9_launching_window_is_10_min(tmp_path):
+    import time as _time
+
+    svc, store = _svc4(tmp_path)
+    assert svc.do_register(_point4())["ok"]
+    now = _time.time()
+    young = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(now - 9 * 60))
+    old = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(now - 11 * 60))
+    row = _launching_row("idem-win-10min", young)
+    store.job_insert_launching(row)
+    assert svc.autopilot.poll_and_finalize() == []
+    assert store.job_get(row["job_id"])["status"] == "launching"
+    store.cx.execute("UPDATE jobs SET created_at=? WHERE job_id=?",
+                     (old, row["job_id"]))
+    store.cx.commit()
+    out = svc.autopilot.poll_and_finalize()
+    assert [a["action"] for a in out] == ["train_failed"]
+    assert store.job_get(row["job_id"])["status"] == "failed"
+
+
 def test_T_PT5_crash_between_mark_done_and_store(tmp_path, monkeypatch):
     import pytest as _pt
 
@@ -656,11 +935,11 @@ def test_T_PT5_crash_between_mark_done_and_store(tmp_path, monkeypatch):
     orig = ap._save_private_model
     calls = []
 
-    def boom_once(join, job, model):
+    def boom_once(join, job, model, store=None):
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("crash now")
-        return orig(join, job, model)
+        return orig(join, job, model, store)
 
     monkeypatch.setattr(ap, "_save_private_model", boom_once)
     _month = store.job_get(r["job_id"])["created_at"][:7]
@@ -752,7 +1031,7 @@ def test_T_PT6_files_no_heldout_leak_and_marker(tmp_path):
             for i in range(9)]
     rows = [render_export_row(p, r) for r in raws]
     tr, _, jobs, _ = _trainer(tmp_path)
-    tr.launch(rows, "smoke", "idem5")
+    tr.launch(rows, "smoke", "idem-pt6-x")
     want = {}
     for r in rows:
         want.setdefault(r["split"], []).append(
@@ -760,11 +1039,11 @@ def test_T_PT6_files_no_heldout_leak_and_marker(tmp_path):
     for split, name in (("train", "train"), ("calib", "dev"),
                         ("heldout", "heldout")):
         got = [json.loads(line) for line in
-               (jobs / "idem5" / f"{name}.jsonl").read_text().splitlines()]
+               (jobs / "idem-pt6-x" / f"{name}.jsonl").read_text().splitlines()]
         assert got == want.get(split, [])
     held_ids = {id(r) for r in want.get("heldout", [])}
     assert not (held_ids & {id(r) for r in want.get("train", [])})
-    meta = json.loads((jobs / "idem5" / "meta.json").read_text())
+    meta = json.loads((jobs / "idem-pt6-x" / "meta.json").read_text())
     assert meta["export_marker"] == {"ts": "2026-01-01T00:00:08Z",
                                      "decision_id": "d08", "seq": 8}
 

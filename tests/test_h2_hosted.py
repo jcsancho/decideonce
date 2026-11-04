@@ -454,6 +454,21 @@ def test_T_HB5_stale_reservation_released(tmp_path):
     assert store.spend_open(month, "hosted_jev")["n"] == 1
 
 
+def test_Y9_hosted_timeout_settles_reserve(tmp_path):
+    def slow(body):
+        raise DeciderError("timeout", "upstream slow")
+
+    svc, store, _, _ = make_custom(tmp_path, slow)
+    assert svc.do_register(choice_point())["ok"]
+    to_shadow(store)
+    r = svc.do_decide({"point_id": "hb.shape", "context": ctx()})
+    assert r["ok"] and r["mode"] == "teacher"
+    month = time.strftime("%Y-%m", time.gmtime())
+    assert store.spend_open(month, "hosted_jev")["n"] == 0
+    got = store.spend_get(month, "hosted_jev")
+    assert got["usd"] == pytest.approx(0.0005) and got["calls"] == 1
+
+
 def test_T_HB5_budget_below_reservation_refuses_startup(tmp_path):
     cfg = load_config()
     cfg["store"]["data_dir"] = str(tmp_path)

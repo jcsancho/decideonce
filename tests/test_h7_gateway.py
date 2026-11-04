@@ -80,6 +80,46 @@ def test_T_HB9_gateway_tiered_call_state_spend_fit(tmp_path):
     assert {r["decider"] for r in rows} == {"hosted_jev"}
 
 
+def test_Z3_gateway_logs_pending_probe(tmp_path):
+    from decideonce.deciders.base import DecideResult
+    from decideonce.deciders.fake import FakeDecider
+
+    svc, gw, store, cfg = make_tiered(tmp_path)
+    cfg["serve"]["audit_rate"] = 1.0  # serve rows join the switch set
+    assert svc.do_register(gw_point())["ok"]
+    store.save_model("gw.h7", 1, "private", "v1-old.json",
+                     {"model_ref": "old-m", "temperature": 1.0,
+                      "threshold": 0.5, "job_id": "j-old"})
+    mid = store.save_model(
+        "gw.h7", 1, "private", "v1-new.json",
+        {"model_ref": "new-m", "temperature": 1.0, "threshold": 0.5,
+         "job_id": "j-new"}, active=False)
+    p = store.get_point("gw.h7")
+    p["tier"] = "private"  # server-managed: set like a switch would
+    p["phase"] = "serve"
+    p["pending_private_model"] = {"model_id": mid, "job_id": "j-new"}
+    store.put_point(p)
+
+    class Priv(FakeDecider):
+        def decide_as(self, model, temperature, reqs, timeout_s=None):
+            return [DecideResult(
+                probs={"approve": 0.9, "deny": 0.05, "escalate": 0.05},
+                decider="private", model=model, seconds=0.01,
+                cost_usd=0.0)]
+
+    gw.svc.deciders["private"] = Priv(
+        fn=lambda req: {"approve": 0.9, "deny": 0.05, "escalate": 0.05},
+        decider_tag="private", model_tag="old-m")
+    req = gw_req("ticket 0 label_hint: approve")
+    plan = gw.handle_decision("openai", req, b"")
+    assert plan["probe"]["model_version"] == "old-m"
+    assert plan["pending_probe"]["model_version"] == "new-m"
+    did = gw._insert_decision_row(store.get_point("gw.h7"), plan, req,
+                                  "approve", False, "forwarded", "approve")
+    assert store.get_decision(did)["pending_probe"][
+        "model_version"] == "new-m"
+
+
 # -- Section B: robustness and security --------------------------------------
 
 def test_B8_pool_timeout_counted_as_hosted_error_timeout(tmp_path):
