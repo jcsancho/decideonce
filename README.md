@@ -105,12 +105,8 @@ uv sync
   "env": {"DECIDEONCE_CONFIG": "<repo-path>/decideonce.toml"}}}
 ```
 
-Claude Code reads the same entry from the `mcpServers` object in
-`~/.claude.json`. Or register it in one command (Claude Code / Claude Desktop):
-
-```bash
-claude mcp add decideonce -- uv run --project <repo-path> -m decideonce.server
-```
+Any other MCP client that runs stdio servers can use the same command:
+`uv run --project <repo-path> -m decideonce.server`.
 
 **Plugin** (Muse-only: the `decideonce-workflow` skill that teaches agents the loop above):
 
